@@ -260,9 +260,10 @@ static MONTH_DAYS: [u8; YEARS * 12] = {
     table
 };
 
-/// F1 `YYYY-MM-DDTHH:MM:SSZ` at `data[s..s+20]`; None if it is not exactly that.
+/// The common part of F1 and F2, `YYYY-MM-DDTHH:MM:SS` at `data[s..s+19]`,
+/// as epoch ms of that wall-clock time read as UTC. Requires `s + 20 <= len`.
 #[inline(always)]
-pub fn f1(data: &[u8], s: usize) -> Option<i64> {
+fn iso19(data: &[u8], s: usize) -> Option<i64> {
     debug_assert!(s + 20 <= data.len());
     unsafe {
         let p = data.as_ptr().add(s);
@@ -277,10 +278,10 @@ pub fn f1(data: &[u8], s: usize) -> Option<i64> {
             return None;
         }
         let tail = (p.add(16) as *const u32).read_unaligned();
-        // ':' S1 S2 'Z'
+        // ':' S1 S2 (byte 19 is the caller's)
         let s1 = ((tail >> 8) & 0xFF).wrapping_sub(b'0' as u32);
         let s2 = ((tail >> 16) & 0xFF).wrapping_sub(b'0' as u32);
-        if tail & 0xFF != b':' as u32 || tail >> 24 != b'Z' as u32 || s1 > 9 || s2 > 9 {
+        if tail & 0xFF != b':' as u32 || s1 > 9 || s2 > 9 {
             return None;
         }
         let g = _mm_shuffle_epi8(t, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
@@ -300,10 +301,42 @@ pub fn f1(data: &[u8], s: usize) -> Option<i64> {
             }
             MONTH_START[index as usize] as i64 + day - 1
         } else {
-            return ts::parse(&data[s..s + 20]);
+            if day > ts::days_in_month(year, month) {
+                return None;
+            }
+            ts::days_from_civil(year, month, day)
         };
         Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000)
     }
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` at `data[s..s+20]`; None if it is not exactly that.
+#[inline(always)]
+pub fn f1(data: &[u8], s: usize) -> Option<i64> {
+    if data[s + 19] != b'Z' {
+        return None;
+    }
+    iso19(data, s)
+}
+
+/// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at `data[s..s+25]`; None if it is not exactly that.
+#[inline(always)]
+fn f2(data: &[u8], s: usize) -> Option<i64> {
+    let sign = match data[s + 19] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let d = |i: usize| (data[s + i] as i64).wrapping_sub(b'0' as i64);
+    let (h1, h2, m1, m2) = (d(20), d(21), d(23), d(24));
+    if data[s + 22] != b':' || !(0..10).contains(&h1) || !(0..10).contains(&h2) || !(0..10).contains(&m1) || !(0..10).contains(&m2) {
+        return None;
+    }
+    let (oh, om) = (h1 * 10 + h2, m1 * 10 + m2);
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some(iso19(data, s)? - sign * (oh * 60 + om) * 60_000)
 }
 
 /// Months near the window, keyed by their 8 bytes "YYYY-MM-": the day number
@@ -482,6 +515,9 @@ pub fn timestamp(data: &[u8], s: usize, e: usize) -> Option<i64> {
             }
         }
     }
+    if n == 25 && data[s + 4] == b'-' {
+        return f2(data, s);
+    }
     ts::parse(&data[s..e])
 }
 
@@ -624,6 +660,18 @@ mod tests {
             b"1791071890a00",
             b"179107189000",
             b"2026-10-03T19:58:10-04:00",
+            b"2026-10-04T01:30:00+02:00",
+            b"2026-10-03T10:00:00-00:00",
+            b"2026-10-03T10:00:00+23:59",
+            b"2026-10-03T10:00:00+24:00",
+            b"2026-10-03T10:00:00+05:60",
+            b"2026-10-03T10:00:00*05:00",
+            b"2026-10-03T10:00:00+05-00",
+            b"2026-10-03T10:00:00+0a:00",
+            b"2028-02-29T23:00:00-10:00",
+            b"2027-02-29T23:00:00-10:00",
+            b"1850-03-01T00:00:00+01:00",
+            b"0000000000000000000000000",
             b"00000000000000000000",
         ];
         for s in samples {

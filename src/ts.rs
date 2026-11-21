@@ -41,7 +41,7 @@ fn is_leap(year: i64) -> bool {
 }
 
 #[inline]
-fn days_in_month(year: i64, month: i64) -> i64 {
+pub fn days_in_month(year: i64, month: i64) -> i64 {
     match month {
         2 => {
             if is_leap(year) {
