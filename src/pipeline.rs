@@ -314,16 +314,21 @@ pub fn run() {
     let started = Instant::now();
     let verbose = std::env::var_os("SESSIONS_VERBOSE").is_some();
     let mut last = started;
+    let mut last_cpu = crate::util::cpu_times();
     let mut lap = |name: &str| {
         if verbose {
             let now = Instant::now();
+            let cpu = crate::util::cpu_times();
             eprintln!(
-                "[{:>8.1} ms] {:<10} {:>8.1} ms",
+                "[{:>8.1} ms] {:<10} {:>8.1} ms   user {:>7.1} sys {:>6.1} ms",
                 now.duration_since(started).as_secs_f64() * 1e3,
                 name,
-                now.duration_since(last).as_secs_f64() * 1e3
+                now.duration_since(last).as_secs_f64() * 1e3,
+                (cpu.0 - last_cpu.0) * 1e3,
+                (cpu.1 - last_cpu.1) * 1e3
             );
             last = now;
+            last_cpu = cpu;
         }
     };
 
@@ -460,7 +465,11 @@ pub fn run() {
     let next = AtomicUsize::new(0);
     let survivors: Vec<Scatter<Ev2>> = par_run(threads, |_| {
         let mut out: Scatter<Ev2> = Scatter::new(p2, est_events / threads + 1);
-        let mut table: Vec<Ev1> = Vec::new();
+        // Distinct event IDs of the partition, densely, with an index table
+        // (u32, EMPTY when free) to find them by key.
+        const EMPTY: u32 = u32::MAX;
+        let mut recs: Vec<Ev1> = Vec::new();
+        let mut index: Vec<u32> = Vec::new();
         let mut chunks: Vec<&[Ev1]> = Vec::new();
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
@@ -475,24 +484,29 @@ pub fn run() {
             if n == 0 {
                 continue;
             }
+            assert!(n < EMPTY as usize, "partition too large");
             let cap = (n * 2).next_power_of_two();
             let tbits = cap.trailing_zeros();
             let mask = cap - 1;
-            if table.len() < cap {
-                table.resize(cap, Ev1::default());
+            if index.len() < cap {
+                index.resize(cap, EMPTY);
             }
+            recs.clear();
+            recs.reserve(n);
             for chunk in &chunks {
                 for rec in chunk.iter() {
                     let mut h = take(fib(rec.key), bits1, tbits);
                     loop {
-                        let slot = unsafe { table.get_unchecked_mut(h) };
-                        if slot.key == 0 {
-                            *slot = *rec;
+                        let i = unsafe { *index.get_unchecked(h) };
+                        if i == EMPTY {
+                            unsafe { *index.get_unchecked_mut(h) = recs.len() as u32 };
+                            recs.push(*rec);
                             break;
                         }
-                        if slot.key == rec.key {
-                            if rec.ingest < slot.ingest {
-                                *slot = *rec;
+                        let kept = unsafe { recs.get_unchecked_mut(i as usize) };
+                        if kept.key == rec.key {
+                            if rec.ingest < kept.ingest {
+                                *kept = *rec;
                             }
                             break;
                         }
@@ -500,16 +514,13 @@ pub fn run() {
                     }
                 }
             }
-            for slot in table[..cap].iter_mut() {
-                if slot.key == 0 {
-                    continue;
+            for r in &recs {
+                if r.tp & VALID != 0 {
+                    let ev = Ev2 { pk: r.pk, t: r.tp as u32, price: ((r.tp >> 32) & 0xFF_FFFF) as u32 };
+                    out.push(take(fib(r.pk & PERSON_MASK), 0, bits2), ev);
                 }
-                if slot.tp & VALID != 0 {
-                    let ev = Ev2 { pk: slot.pk, t: slot.tp as u32, price: ((slot.tp >> 32) & 0xFF_FFFF) as u32 };
-                    out.push(take(fib(slot.pk & PERSON_MASK), 0, bits2), ev);
-                }
-                slot.key = 0;
             }
+            index[..cap].fill(EMPTY);
         }
         out.finish();
         out

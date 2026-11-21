@@ -48,6 +48,7 @@ mod ffi {
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn mremap(old: *mut c_void, old_len: usize, new_len: usize, flags: i32, ...) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
     }
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
@@ -282,5 +283,22 @@ impl<T> SharedMut<T> {
     pub unsafe fn slice_mut(&self, start: usize, end: usize) -> &mut [T] {
         assert!(start <= end && end <= self.len);
         std::slice::from_raw_parts_mut(self.ptr.add(start), end - start)
+    }
+}
+
+/// User and system CPU seconds used so far by every thread of the process.
+pub fn cpu_times() -> (f64, f64) {
+    let mut usage = [0i64; 18];
+    if unsafe { ffi::getrusage(0, &mut usage) } != 0 {
+        return (0.0, 0.0);
+    }
+    (usage[0] as f64 + usage[1] as f64 * 1e-6, usage[2] as f64 + usage[3] as f64 * 1e-6)
+}
+
+#[inline(always)]
+pub fn prefetch(p: *const i8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
     }
 }

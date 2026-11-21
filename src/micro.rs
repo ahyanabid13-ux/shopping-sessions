@@ -50,6 +50,40 @@ pub fn run(path: &str) {
         acc
     });
 
+    for pdep in [true, false] {
+        time(if pdep { "scan_window+pf (pdep)" } else { "scan_window+pf (tzcnt)" }, lines, || {
+            let mut fs = [0usize; 7];
+            let mut fe = [0usize; 7];
+            let mut pos = start;
+            let mut acc = 0u64;
+            while pos < fast_end {
+                crate::util::prefetch(data.as_ptr().wrapping_add(pos + 2048) as *const i8);
+                crate::util::prefetch(data.as_ptr().wrapping_add(pos + 2048 + 64) as *const i8);
+                let r = if pdep { fast::scan_window::<7, true>(&data, pos, &mut fs, &mut fe) } else { fast::scan_window::<7, false>(&data, pos, &mut fs, &mut fe) };
+                match r {
+                    fast::Window::Line { end, ok } => {
+                        acc += ok as u64 + fe[3] as u64;
+                        pos = end + 1;
+                    }
+                    fast::Window::Long => break,
+                }
+            }
+            acc
+        });
+    }
+    time("prefetch-only line walk", lines, || {
+        let mut pos = start;
+        let mut acc = 0u64;
+        while pos < fast_end {
+            crate::util::prefetch(data.as_ptr().wrapping_add(pos + 2048) as *const i8);
+            crate::util::prefetch(data.as_ptr().wrapping_add(pos + 2048 + 64) as *const i8);
+            let nl = crate::csv::memchr_nl(&data, pos).unwrap();
+            acc += data[pos] as u64;
+            pos = nl + 1;
+        }
+        acc
+    });
+
     time("scan_window + timestamps", lines, || {
         let mut fs = [0usize; 7];
         let mut fe = [0usize; 7];

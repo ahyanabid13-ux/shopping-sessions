@@ -21,10 +21,11 @@ for _ in range(runs):
     cpus.append((r1.ru_utime - r0.ru_utime, r1.ru_stime - r0.ru_stime))
     if p.returncode != 0:
         sys.exit(p.stderr)
-    for m in re.finditer(r"\]\s+(\S+)\s+([0-9.]+) ms", p.stderr):
-        phases.setdefault(m.group(1), []).append(float(m.group(2)))
+    for m in re.finditer(r"\]\s+(\S+)\s+([0-9.]+) ms\s+user\s+([0-9.]+) sys\s+([0-9.]+) ms", p.stderr):
+        phases.setdefault(m.group(1), []).append((float(m.group(2)), float(m.group(3)), float(m.group(4))))
 for name, v in phases.items():
-    print(f"{name:<10} min {min(v):8.1f}  med {statistics.median(v):8.1f} ms")
+    wall = [x[0] for x in v]; user = [x[1] for x in v]; sys_ = [x[2] for x in v]
+    print(f"{name:<10} wall min {min(wall):8.1f} med {statistics.median(wall):8.1f}   user med {statistics.median(user):8.1f}   sys med {statistics.median(sys_):7.1f} ms")
 print(f"{'wall':<10} min {min(walls)*1e3:8.1f}  med {statistics.median(walls)*1e3:8.1f} ms")
 best = min(cpus, key=lambda c: c[0] + c[1])
 print(f"{'cpu':<10} min {sum(best)*1e3:8.1f} ms (user {best[0]*1e3:.0f} sys {best[1]*1e3:.0f})  med {statistics.median(u+s for u,s in cpus)*1e3:8.1f} ms")
