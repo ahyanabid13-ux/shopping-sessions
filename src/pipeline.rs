@@ -210,8 +210,8 @@ fn partition_bits(rows: usize) -> u32 {
     (ideal.log2().round() as u32).clamp(4, 13)
 }
 
-/// Records whose person-table slot was prefetched, resolved in one go.
-const BATCH: usize = 32;
+/// How many parsed records later a prefetched person-table line is read.
+const LOOKAHEAD: usize = 16;
 /// How far ahead of the line being split its bytes are prefetched.
 const PREFETCH_AHEAD: usize = 2048;
 
@@ -262,14 +262,15 @@ impl Parser<'_> {
     /// Parses one events segment into `out` (partitioned by event key).
     #[inline(never)]
     fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
-        let mut batch = [Ev1::default(); BATCH];
-        let mut n = 0usize;
-        let flush = |batch: &[Ev1], out: &mut Scatter<Ev1>| {
-            for rec in batch {
-                let mut r = *rec;
-                r.pk = links.person_of(r.pk & USER_MASK) | (r.pk & !PERSON_MASK);
-                out.push(take(fib(r.key), 0, bits1), r);
-            }
+        // Each valid copy's person-table line is prefetched when it is parsed
+        // and resolved LOOKAHEAD copies later, so every lookup gets the same
+        // head start.
+        let mut ring = [Ev1::default(); LOOKAHEAD];
+        let mut count = 0usize;
+        let resolve = |rec: Ev1, out: &mut Scatter<Ev1>| {
+            let mut r = rec;
+            r.pk = links.person_of(r.pk & USER_MASK) | (r.pk & !PERSON_MASK);
+            out.push(take(fib(r.key), 0, bits1), r);
         };
         lines::<7>(d, seg, |fs, fe| {
             let Some(rec) = self.event(d, fs, fe) else { return };
@@ -278,39 +279,41 @@ impl Parser<'_> {
                 return;
             }
             links.prefetch(rec.pk & USER_MASK);
-            batch[n] = rec;
-            n += 1;
-            if n == BATCH {
-                flush(&batch, out);
-                n = 0;
+            let slot = unsafe { ring.get_unchecked_mut(count % LOOKAHEAD) };
+            if count >= LOOKAHEAD {
+                resolve(*slot, out);
             }
+            *slot = rec;
+            count += 1;
         });
-        flush(&batch[..n], out);
+        for i in count.saturating_sub(LOOKAHEAD)..count {
+            resolve(ring[i % LOOKAHEAD], out);
+        }
     }
 
     /// Parses one clicks segment into `out` (partitioned by person).
     #[inline(never)]
     fn clicks_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
-        let mut batch = [Ck2::default(); BATCH];
-        let mut n = 0usize;
-        let flush = |batch: &[Ck2], out: &mut Scatter<Ck2>| {
-            for c in batch {
-                let mut c = *c;
-                c.pk = links.person_of(c.pk);
-                out.push(take(fib(c.pk), 0, bits2), c);
-            }
+        let mut ring = [Ck2::default(); LOOKAHEAD];
+        let mut count = 0usize;
+        let resolve = |c: Ck2, out: &mut Scatter<Ck2>| {
+            let mut c = c;
+            c.pk = links.person_of(c.pk);
+            out.push(take(fib(c.pk), 0, bits2), c);
         };
         lines::<4>(d, seg, |fs, fe| {
             let Some(c) = self.click(d, fs, fe) else { return };
             links.prefetch(c.pk);
-            batch[n] = c;
-            n += 1;
-            if n == BATCH {
-                flush(&batch, out);
-                n = 0;
+            let slot = unsafe { ring.get_unchecked_mut(count % LOOKAHEAD) };
+            if count >= LOOKAHEAD {
+                resolve(*slot, out);
             }
+            *slot = c;
+            count += 1;
         });
-        flush(&batch[..n], out);
+        for i in count.saturating_sub(LOOKAHEAD)..count {
+            resolve(ring[i % LOOKAHEAD], out);
+        }
     }
 }
 
