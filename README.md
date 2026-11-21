@@ -8,6 +8,9 @@ reads `/data`, applies every rule of `rules.md` exactly, and writes
 
 The run is five parallel phases. Every phase uses all `NCPU` threads, and the
 data flows between phases as cache-sized partitions, never as one big sort.
+The partition count is near sqrt(rows / 3.2) (2048 at 20M events, 4096 at
+60M): each thread stages one cache line per partition, and each partition's
+tables grow as rows / partitions, so that count keeps both small.
 
 1. **Links.** Link lines are parsed in parallel and merged with a lock-free
    union-find (CAS on parent pointers, roots always hung under the smaller
@@ -29,14 +32,15 @@ data flows between phases as cache-sized partitions, never as one big sort.
      is interned, so equality stays exact.
    - **Timestamps.** F1, F2 and F3 are parsed with SIMD/SWAR and a
      calendar table.
-   - **Person lookups.** These are prefetched and resolved in batches of 32.
+   - **Person lookups.** Each is prefetched when its line is parsed and
+     resolved 16 records later, so every lookup gets the same head start.
    - **Output.** Event copies are scattered by event ID and clicks by person,
      both through write-combining staging buffers and non-temporal stores
      into chunked, huge-page memory.
-3. **Dedup.** For each event-ID partition, an open-addressing table keeps the
-   copy with the smallest `ingest_ts`. That copy alone decides validity,
-   since dedup comes before validation. One sequential sweep emits the
-   valid winners, scattered by person.
+3. **Dedup.** For each event-ID partition, the distinct event IDs are kept
+   densely, each with the copy with the smallest `ingest_ts`, found through
+   a small u32 index table. That copy alone decides validity, since dedup
+   comes before validation. The valid winners are scattered by person.
 4. **People.** For each person partition:
    - Events are grouped by person with a counting sort, then sorted by time
      as 8-byte keys (`t << 32 | purchase`).
@@ -60,6 +64,9 @@ rules, so they can never change the credited click or the assist set.
   passes all 36 edge-case fixtures, and also passes through Docker with the
   scorer's flags.
 - The 1M-event dev set matches `dev-answer` exactly.
+- `tools/reference.py` agrees with the engine on 7 further seeds (1K to 2M
+  events, including a window over 29 February 2028) at 1, 2, 3 and 8
+  threads with both line splitters: 56 of 56 runs identical.
 - `tools/reference.py` is a slow, literal Python implementation of
   `rules.md`. It also passes the fixtures and the dev answer. The engine
   matches it exactly on further generated seeds (0.7M to 2M events each).
