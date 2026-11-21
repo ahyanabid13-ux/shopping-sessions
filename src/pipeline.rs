@@ -208,6 +208,8 @@ fn partition_bits(rows: usize, per_partition: usize) -> u32 {
 
 /// Records whose person-table slot was prefetched, resolved in one go.
 const BATCH: usize = 32;
+/// How far ahead of the line being split its bytes are prefetched.
+const PREFETCH_AHEAD: usize = 2048;
 
 /// Lines of one segment, through the window fast path when possible.
 /// Calls `f(fs, fe)` for every well-formed line with N fields.
@@ -219,6 +221,13 @@ fn lines<const N: usize>(d: &[u8], seg: &Segment, mut f: impl FnMut(&[usize; N],
     let mut fs = [0usize; N];
     let mut fe = [0usize; N];
     while pos < seg.end && pos < len {
+        // Page-cache pages are scattered 4 KiB frames: the hardware
+        // prefetcher stops at each page boundary, so fetch well ahead.
+        unsafe {
+            let ahead = d.as_ptr().wrapping_add(pos + PREFETCH_AHEAD) as *const i8;
+            std::arch::x86_64::_mm_prefetch(ahead, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(ahead.wrapping_add(64), std::arch::x86_64::_MM_HINT_T0);
+        }
         let (end, ok) = match if pos < fast_end { fast::scan_window::<N>(d, pos, &mut fs, &mut fe) } else { fast::Window::Long } {
             fast::Window::Line { end, ok } => (end, ok),
             fast::Window::Long => {

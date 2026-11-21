@@ -147,6 +147,24 @@ const POW36: [u64; 9] = [
     2_821_109_907_456,
 ];
 
+/// A number whose order is the byte-wise order of fast keys' IDs (same
+/// prefix): the digits padded with '0' to 8, then the length. Padding with the
+/// smallest digit keeps the order; equal padded values mean one string is a
+/// prefix of the other, and the shorter sorts first. Below 2^46.
+#[inline]
+pub fn order_key(key: u64) -> u64 {
+    debug_assert!(key & ODD == 0 && key != 0);
+    let (len, value) = fast_parts(key);
+    (value * POW36[8 - len]) << 4 | len as u64
+}
+
+/// The fast key whose `order_key` is `order`.
+#[inline]
+pub fn key_of_order(order: u64) -> u64 {
+    let len = (order & 15) as usize;
+    fast_from(len, (order >> 4) / POW36[8 - len])
+}
+
 /// Byte-wise order of the two IDs `a` and `b` (both written with `prefix`).
 pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &[Vec<u8>]) -> Ordering {
     if a == b {
@@ -186,11 +204,17 @@ mod tests {
             let mut out = Vec::new();
             write_id(&mut out, k, b'u', &odd);
             assert_eq!(&out[..], *s);
+            if k & ODD == 0 {
+                assert_eq!(key_of_order(order_key(k)), k);
+            }
         }
         for (i, &a) in keys.iter().enumerate() {
             for (j, &b) in keys.iter().enumerate() {
                 assert_eq!(cmp_ids(a, b, b'u', &odd), ids[i].cmp(ids[j]), "{:?} {:?}", ids[i], ids[j]);
                 assert_eq!(a == b, ids[i] == ids[j]);
+                if a & ODD == 0 && b & ODD == 0 {
+                    assert_eq!(order_key(a).cmp(&order_key(b)), ids[i].cmp(ids[j]));
+                }
             }
         }
     }
