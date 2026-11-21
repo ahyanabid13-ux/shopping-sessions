@@ -29,39 +29,50 @@ const KEY43: u64 = (1 << 43) - 1;
 /// Persons that fit next to a compact key in one 8-byte slot.
 const NARROW_PERSONS: usize = 1 << 21;
 
-/// Read-only map from user key to person. Narrow slots pack the compact key
-/// and the person into 8 bytes; wide slots (key, person) pairs, as two
-/// words, are used only when there are too many persons for that.
+/// Words per bucket: one 64-byte cache line.
+const LINE_WORDS: usize = 8;
+
+/// Read-only map from user key to person: linear probing over 64-byte
+/// buckets at load <= 1/2. A key's probe starts at the first slot of its home
+/// bucket, so a lookup almost always touches the one cache line that was
+/// prefetched for it. Narrow slots (one word) pack the compact key and the
+/// person; wide slots (two words: key, person) are used only when there are
+/// too many persons for that.
 pub struct LinkTable {
-    narrow: Vec<u64>,
-    wide: Vec<u64>,
-    cap: usize,
+    words: Vec<u64>,
+    /// Words skipped so that bucket 0 starts on a cache line.
+    off: usize,
+    wide: bool,
+    buckets: usize,
     /// Name (the byte-wise smallest user key) of each linked person.
     pub names: Vec<u64>,
 }
 
+/// First word of the home bucket of `ck`.
 #[inline(always)]
-fn home_of(ck: u64, cap: usize) -> usize {
-    // Fast range reduction of the hash's top 32 bits onto 0..cap.
-    (((fib(ck) >> 32) * cap as u64) >> 32) as usize
+fn home_of(ck: u64, buckets: usize) -> usize {
+    // Fast range reduction of the hash's top 32 bits onto 0..buckets.
+    ((((fib(ck) >> 32) * buckets as u64) >> 32) as usize) * LINE_WORDS
+}
+
+/// Buckets for `ids` keys at load <= 1/2.
+fn buckets_for(ids: usize, wide: bool) -> usize {
+    let per_bucket = if wide { LINE_WORDS / 2 } else { LINE_WORDS };
+    (2 * ids).div_ceil(per_bucket).max(1)
+}
+
+/// Offset (in words) of the first 64-byte boundary in `v`.
+fn line_offset(v: &[u64]) -> usize {
+    v.as_ptr().align_offset(64)
 }
 
 impl LinkTable {
     #[inline(always)]
-    fn home(&self, ck: u64) -> usize {
-        home_of(ck, self.cap)
-    }
-
-    #[inline(always)]
     pub fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let h = self.home(compact(key));
-            let p = if self.wide.is_empty() {
-                self.narrow.as_ptr().add(h) as *const i8
-            } else {
-                self.wide.as_ptr().add(2 * h) as *const i8
-            };
+            let h = home_of(compact(key), self.buckets);
+            let p = self.words.as_ptr().add(self.off + h) as *const i8;
             std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
         }
     }
@@ -70,74 +81,101 @@ impl LinkTable {
     #[inline(always)]
     pub fn person_of(&self, key: u64) -> u64 {
         let ck = compact(key);
-        let mut i = self.home(ck);
-        if self.wide.is_empty() {
-            loop {
-                let s = unsafe { *self.narrow.get_unchecked(i) };
-                if s & KEY43 == ck {
-                    return LINKED | (s >> 43);
-                }
-                if s == 0 {
-                    return key;
-                }
-                i += 1;
-                if i == self.cap {
-                    i = 0;
+        let total = self.buckets * LINE_WORDS;
+        let mut i = home_of(ck, self.buckets);
+        let base = unsafe { self.words.as_ptr().add(self.off) };
+        if !self.wide {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::*;
+                // A whole bucket at once: the key's slot, or an empty slot
+                // that ends the probe, is almost always in the home bucket.
+                let km = _mm256_set1_epi64x(KEY43 as i64);
+                let want = _mm256_set1_epi64x(ck as i64);
+                let zero = _mm256_setzero_si256();
+                loop {
+                    let line = base.add(i) as *const __m256i;
+                    let a = _mm256_load_si256(line);
+                    let b = _mm256_load_si256(line.add(1));
+                    let hit = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(a, km), want)))
+                        | _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(b, km), want))) << 4;
+                    if hit != 0 {
+                        return LINKED | *base.add(i + hit.trailing_zeros() as usize) >> 43;
+                    }
+                    let empty = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, zero)))
+                        | _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, zero)));
+                    if empty != 0 {
+                        return key;
+                    }
+                    i += LINE_WORDS;
+                    if i == total {
+                        i = 0;
+                    }
                 }
             }
-        } else {
-            loop {
-                let k = unsafe { *self.wide.get_unchecked(2 * i) };
-                if k == ck {
-                    return LINKED | unsafe { *self.wide.get_unchecked(2 * i + 1) };
-                }
-                if k == 0 {
-                    return key;
-                }
-                i += 1;
-                if i == self.cap {
-                    i = 0;
-                }
+        }
+        loop {
+            let k = unsafe { *base.add(i) };
+            if k == ck {
+                return LINKED | unsafe { *base.add(i + 1) };
+            }
+            if k == 0 {
+                return key;
+            }
+            i += 2;
+            if i == total {
+                i = 0;
             }
         }
     }
 }
 
 /// The table while it is being filled by every thread at once. Each key is
-/// inserted exactly once, so a slot only ever goes from empty to full.
+/// inserted exactly once, so a slot only ever goes from empty to full, and
+/// every slot a probe passes stays full: a lookup that meets an empty slot
+/// can stop.
 struct TableBuilder {
-    narrow: Vec<AtomicU64>,
-    wide: Vec<AtomicU64>,
-    cap: usize,
+    words: Vec<AtomicU64>,
+    off: usize,
+    wide: bool,
+    buckets: usize,
 }
 
 impl TableBuilder {
+    fn new(ids: usize, wide: bool) -> TableBuilder {
+        let buckets = buckets_for(ids, wide);
+        let words: Vec<AtomicU64> = unsafe { zeroed_vec(buckets * LINE_WORDS + LINE_WORDS) };
+        let off = words.as_ptr().align_offset(64);
+        assert!(off < LINE_WORDS);
+        TableBuilder { words, off, wide, buckets }
+    }
+
     fn insert(&self, key: u64, person: u64) {
         let ck = compact(key);
-        let mut i = home_of(ck, self.cap);
-        if self.wide.is_empty() {
-            let value = ck | person << 43;
-            loop {
-                let slot = &self.narrow[i];
-                if slot.load(Ordering::Relaxed) == 0
-                    && slot.compare_exchange(0, value, Ordering::Relaxed, Ordering::Relaxed).is_ok()
-                {
-                    return;
+        let total = self.buckets * LINE_WORDS;
+        let mut i = home_of(ck, self.buckets);
+        let (step, value) = if self.wide { (2, ck) } else { (1, ck | person << 43) };
+        loop {
+            let slot = &self.words[self.off + i];
+            if slot.load(Ordering::Relaxed) == 0
+                && slot.compare_exchange(0, value, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                if self.wide {
+                    self.words[self.off + i + 1].store(person, Ordering::Relaxed);
                 }
-                i = if i + 1 == self.cap { 0 } else { i + 1 };
+                return;
             }
-        } else {
-            loop {
-                let slot = &self.wide[2 * i];
-                if slot.load(Ordering::Relaxed) == 0
-                    && slot.compare_exchange(0, ck, Ordering::Relaxed, Ordering::Relaxed).is_ok()
-                {
-                    self.wide[2 * i + 1].store(person, Ordering::Relaxed);
-                    return;
-                }
-                i = if i + 1 == self.cap { 0 } else { i + 1 };
+            i += step;
+            if i == total {
+                i = 0;
             }
         }
+    }
+
+    fn finish(self, names: Vec<u64>) -> LinkTable {
+        let words = into_plain(self.words);
+        debug_assert_eq!(line_offset(&words), self.off);
+        LinkTable { words, off: self.off, wide: self.wide, buckets: self.buckets, names }
     }
 }
 
@@ -302,16 +340,11 @@ pub fn build(pairs: &[Vec<(u64, u64)>], threads: usize, odd: &[Vec<u8>]) -> Link
         eprintln!("    links: {total} pairs, capacity {capacity}, {linked_ids} linked IDs, {persons} persons");
     }
 
-    // One parallel pass fills the read-only table (load ~0.67) and names each
+    // One parallel pass fills the read-only table and names each
     // person by its byte-wise smallest ID: a CAS-min over `order_key + 1`
     // (0 = none yet) for generator IDs; the rare odd IDs are compared after.
-    let cap = (linked_ids + linked_ids / 2).max(64);
     let wide = persons >= NARROW_PERSONS;
-    let table = TableBuilder {
-        narrow: if wide { Vec::new() } else { unsafe { zeroed_vec(cap) } },
-        wide: if wide { unsafe { zeroed_vec(2 * cap) } } else { Vec::new() },
-        cap,
-    };
+    let table = TableBuilder::new(linked_ids, wide);
     let best: Vec<AtomicU64> = unsafe { zeroed_vec(persons) };
     let odd_members: Vec<Vec<(u32, u64)>> = par_run(threads, |t| {
         let (lo, hi) = range(t);
@@ -350,6 +383,50 @@ pub fn build(pairs: &[Vec<(u64, u64)>], threads: usize, odd: &[Vec<u8>]) -> Link
     }
     debug_assert!(names.iter().all(|&n| n != 0));
     lap("fill");
-    LinkTable { narrow: into_plain(table.narrow), wide: into_plain(table.wide), cap, names }
+    table.finish(names)
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn check(wide: bool, n: usize, seed: u64) {
+        let mut x = seed;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut truth: HashMap<u64, u64> = HashMap::new();
+        while truth.len() < n {
+            let key = next() % ((1 << 43) - 1) + 1;
+            let person = next() % if wide { 1 << 40 } else { NARROW_PERSONS as u64 };
+            truth.entry(key).or_insert(person);
+        }
+        let builder = TableBuilder::new(n, wide);
+        for (&k, &p) in &truth {
+            builder.insert(k, p);
+        }
+        let table = builder.finish(Vec::new());
+        for (&k, &p) in &truth {
+            assert_eq!(table.person_of(k), LINKED | p);
+        }
+        for _ in 0..n * 4 {
+            let key = next() % ((1 << 43) - 1) + 1;
+            if !truth.contains_key(&key) {
+                assert_eq!(table.person_of(key), key);
+            }
+        }
+    }
+
+    #[test]
+    fn table_matches_hashmap() {
+        for (i, n) in [1usize, 2, 7, 8, 9, 100, 4096, 100_000].into_iter().enumerate() {
+            check(false, n, 0x9E37_79B9 + i as u64);
+            check(true, n, 0x51ED_2701 + i as u64);
+        }
+    }
 }
