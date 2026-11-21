@@ -55,13 +55,20 @@ pub struct Ctx<'a> {
     pub odd: &'a [Vec<u8>],
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct Credited {
+    pub sessions: u32,
+    pub purchasing: u32,
+    pub revenue: u64,
+}
+
 /// Per-thread accumulators for both tables.
 pub struct Out {
     pub rows: Vec<UdRow>,
-    /// Credited counts, indexed `campaign * days + day`.
-    pub sessions: Vec<u32>,
-    pub purchasing: Vec<u32>,
-    pub revenue: Vec<u64>,
+    /// Credited sessions, purchasing sessions and revenue, indexed
+    /// `campaign * days + day`: one 16-byte cell per session update.
+    pub credited: Vec<Credited>,
     /// Assisted counts, indexed `day * campaigns + campaign`.
     pub assisted: Vec<u32>,
 }
@@ -71,9 +78,7 @@ impl Out {
         let cells = ctx.campaigns * ctx.days;
         Out {
             rows: Vec::new(),
-            sessions: vec![0; cells],
-            purchasing: vec![0; cells],
-            revenue: vec![0; cells],
+            credited: vec![Credited::default(); cells],
             assisted: vec![0; cells],
         }
     }
@@ -411,9 +416,10 @@ fn person(
             0
         };
         let cell = credited * days + day;
-        out.sessions[cell] += 1;
-        out.purchasing[cell] += purchased as u32;
-        out.revenue[cell] += revenue;
+        let c = &mut out.credited[cell];
+        c.sessions += 1;
+        c.purchasing += purchased as u32;
+        c.revenue += revenue;
         let assisted = &mut out.assisted[day * campaigns..(day + 1) * campaigns];
         for &c in active.iter() {
             assisted[c as usize] += 1;

@@ -69,9 +69,10 @@ pub fn write_campaign_daily(path: &Path, outs: &[person::Out], ctx: &person::Ctx
         for c in 0..ctx.campaigns {
             for d in 0..ctx.days {
                 let cell = c * ctx.days + d;
-                sessions[cell] += o.sessions[cell] as u64;
-                purchasing[cell] += o.purchasing[cell] as u64;
-                revenue[cell] += o.revenue[cell];
+                let cr = o.credited[cell];
+                sessions[cell] += cr.sessions as u64;
+                purchasing[cell] += cr.purchasing as u64;
+                revenue[cell] += cr.revenue;
                 assisted[cell] += o.assisted[d * ctx.campaigns + c] as u64;
             }
         }
