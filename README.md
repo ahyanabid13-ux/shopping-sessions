@@ -11,12 +11,19 @@ data flows between phases as cache-sized partitions, never as one big sort.
 
 1. **Links.** Link lines are parsed in parallel and merged with a lock-free
    union-find (CAS on parent pointers, roots always hung under the smaller
-   index). Each person is named by its byte-wise smallest ID. The result is a
-   read-only table from user ID to person: 8-byte slots, about 2/3 full.
+   index). Each person is named by its byte-wise smallest ID, found with a
+   CAS-min over an integer whose order is the IDs' byte order. The result
+   is a read-only table from user ID to person, filled by all threads at
+   once: 8-byte slots in 64-byte buckets at most half full, so a lookup
+   almost always touches the one cache line that was prefetched for it.
 2. **Parse.** Files are memory-mapped and cut into 2 MiB segments.
    - **Lines.** Each line is split from a 128-byte window. AVX2 builds the
      newline, comma and quote bitmasks, `pdep` finds each comma, and `pext`
-     checks that every quote wraps a whole field.
+     checks that every quote wraps a whole field. On CPUs where those two
+     instructions are microcoded (AMD Zen 1/2, Hygon; read from CPUID) an
+     equivalent tzcnt walk is used instead. The input is prefetched 2 KiB
+     ahead, since page-cache pages are scattered 4 KiB frames that the
+     hardware prefetcher does not cross.
    - **IDs.** Generator IDs (`e…`, `u…`, `k…`: a letter and up to 8 base-36
      digits) are decoded with SIMD into a dense 43-bit key. Any other string
      is interned, so equality stays exact.
@@ -39,9 +46,10 @@ data flows between phases as cache-sized partitions, never as one big sort.
      and the set of assisting campaigns.
    - Each thread writes its own `user_daily` Parquet file as soon as it
      finishes; `campaign_daily` is merged at the end.
-5. **Parquet.** A small built-in writer: PLAIN pages, RLE definition levels,
-   `DATE` and `STRING` logical types. It is read back correctly by polars,
-   pyarrow and DuckDB.
+5. **Parquet.** A small built-in writer: one row group per file and one
+   PLAIN page per column, encoded in a single pass over the rows, with RLE
+   definition levels and `DATE` and `STRING` logical types. It is read back
+   correctly by polars, pyarrow and DuckDB.
 
 Click duplicates are not removed. Copies of a click are identical by the
 rules, so they can never change the credited click or the assist set.
@@ -55,8 +63,10 @@ rules, so they can never change the credited click or the assist set.
 - `tools/reference.py` is a slow, literal Python implementation of
   `rules.md`. It also passes the fixtures and the dev answer. The engine
   matches it exactly on further generated seeds (0.7M to 2M events each).
-- Unit tests (`cargo test --release`) fuzz the SIMD line splitter against
-  the scalar CSV rules on 1M random lines. They also check timestamps
+- Unit tests (`cargo test --release`) fuzz both forms of the SIMD line
+  splitter against the scalar CSV rules on 1M random lines
+  (`SESSIONS_PDEP=0` forces the tzcnt form in a full run). They also check
+  the person table against a hash map. They also check timestamps
   against the reference parser and ID keys for round trips and byte order.
 
 ## Build and run
