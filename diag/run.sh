@@ -1,51 +1,55 @@
 #!/bin/sh
 # DIAGNOSTIC ONLY (branch diag-20m). Prints the scorer's environment and the
-# engine's per-phase timings on the dev set and on a 20M-event set generated in
-# /scratch, then exits non-zero on purpose so this build can never be scored.
-# Nothing is written to /output.
+# engine's per-phase timings on a 20M-event set generated in /scratch, then
+# exits non-zero on purpose so this build can never be scored. Nothing is
+# written to /output. The scorer shows only the last ~1.2 KB of stderr, so the
+# full log goes to a file and a compact summary is printed last.
 set -u
 S=${SCRATCH_DIR:-/scratch}
-log() { echo "$@" >&2; }
-T="/usr/bin/time -f TIME_wall=%e_user=%U_sys=%S_cpu=%P_maxrss_kb=%M_minflt=%R_majflt=%F_vcsw=%w_ivcsw=%c"
-
-log "=== ENV"
-log "uname: $(uname -r)  nproc: $(nproc)  NCPU=${NCPU:-} MEM_GB=${MEM_GB:-}"
-grep -m1 'model name' /proc/cpuinfo >&2
-grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx2|bmi2|avx512f|avx512bw|avx512vbmi|avx512vl|vpclmulqdq|erms|fsrm' | tr '\n' ' ' >&2; log ""
-lscpu 2>/dev/null | grep -E 'Thread|Core|Socket|NUMA node\(|L1d|L2|L3|MHz' >&2
-log "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>&1) defrag: $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>&1)"
-log "cgroup cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>&1) cpuset: $(cat /sys/fs/cgroup/cpuset.cpus.effective 2>&1) mem.max: $(cat /sys/fs/cgroup/memory.max 2>&1)"
-log "affinity: $(taskset -pc $$ 2>&1)"
-grep -E ' /data | /scratch | /output ' /proc/mounts >&2
-log "data: $(du -sh /data 2>&1 | cut -f1)  meminfo: $(grep -E 'MemTotal|MemAvailable' /proc/meminfo | tr -s ' ' | tr '\n' ' ')"
-log "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid 2>&1)"
+L="$S/full.log"
+: > "$L"
+T="/usr/bin/time -f TIME_wall=%e_user=%U_sys=%S_cpu=%P_rss=%M"
 
 run() { # label, data dir, extra env...
   label=$1; d=$2; shift 2
   rm -rf "$S/o"; mkdir -p "$S/o"
-  log "=== RUN $label"
-  env DATA_DIR="$d" OUTPUT_DIR="$S/o" SESSIONS_VERBOSE=1 "$@" $T /sessions 2>&1 | grep -vE '^\s+write_user_daily\[' >&2
+  echo "=== RUN $label" >> "$L"
+  env DATA_DIR="$d" OUTPUT_DIR="$S/o" SESSIONS_VERBOSE=1 "$@" $T /sessions >> "$L" 2>&1
+}
+# One compact line per run: wall per phase (ms) and the time(1) totals.
+sum() {
+  awk -v want="$1" '
+    /^=== RUN / { on = ($3 == want); next }
+    on && /\] (links|parse|dedup|people) / { for (i=1;i<=NF;i++) if ($i ~ /^(links|parse|dedup|people)$/) { n=$i; v=$(i+1) }; p = p substr(n,1,2) "=" int(v) " " }
+    on && /^TIME_/ { t=$0; gsub(/TIME_|_cpu=[0-9]+%|_rss=/, " ", t) }
+    END { print want ": " p "|" t }' "$L"
 }
 
-run dev-1 /data
-run dev-2 /data
-
-log "=== GEN 20M"
-$T timeout 100 /generate --seed 20 --events 20000000 --clicks 5000000 --output "$S/d20" --threads "$(nproc)" >/dev/null 2>"$S/gen.err"
-tail -2 "$S/gen.err" >&2
-log "d20: $(du -sh "$S/d20" 2>&1 | cut -f1) events files: $(ls "$S/d20/events" 2>/dev/null | wc -l)"
-
+$T timeout 100 /generate --seed 20 --events 20000000 --clicks 5000000 --output "$S/d20" --threads "$(nproc)" > /dev/null 2> "$S/gen.err"
 if [ -f "$S/d20/manifest.json" ]; then
-  run d20-a "$S/d20"
-  run d20-b "$S/d20"
-  run d20-c "$S/d20"
-  run d20-ncpu4 "$S/d20" NCPU=4
-  run d20-pdep0 "$S/d20" SESSIONS_PDEP=0
-  if command -v perf >/dev/null 2>&1; then
-    log "=== PERF STAT d20"
+  run a "$S/d20"
+  run b "$S/d20"
+  run c "$S/d20"
+  run n4 "$S/d20" NCPU=4
+  run n6 "$S/d20" NCPU=6
+  run b10 "$S/d20" SESSIONS_BITS=10
+  run b12 "$S/d20" SESSIONS_BITS=12
+  if command -v perf > /dev/null 2>&1; then
     rm -rf "$S/o"; mkdir -p "$S/o"
-    DATA_DIR="$S/d20" OUTPUT_DIR="$S/o" perf stat -e task-clock,cycles,instructions,cache-misses,LLC-load-misses,dTLB-load-misses,page-faults,context-switches,cpu-migrations /sessions 2>&1 | tail -16 >&2
+    DATA_DIR="$S/d20" OUTPUT_DIR="$S/o" perf stat -x, -e task-clock,cycles,instructions,LLC-load-misses,dTLB-load-misses,branch-misses /sessions > /dev/null 2> "$S/perf.csv"
   fi
 fi
-log "=== DIAGNOSTIC DONE: exiting 3 on purpose (no output written)"
+
+{
+  echo "=== SUMMARY"
+  echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | tr -s ' ')"
+  echo "flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx512f|avx512vbmi|vpclmulqdq|fsrm' | tr '\n' ' ')"
+  echo "topo: $(lscpu 2>/dev/null | grep -E '^(Thread|Core)|L3' | tr -s ' ' | tr '\n' ';')"
+  echo "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>&1) kernel $(uname -r) data $(du -sh "$S/d20" 2>&1 | cut -f1)"
+  echo "gen: $(tail -1 "$S/gen.err" | cut -c1-60)"
+  for r in a b c n4 n6 b10 b12; do sum $r; done
+  [ -f "$S/perf.csv" ] && cut -d, -f1,3 "$S/perf.csv" | tr '\n' ' ' | cut -c1-260
+  echo
+  echo "=== DIAGNOSTIC DONE: exit 3 on purpose"
+} >&2
 exit 3
