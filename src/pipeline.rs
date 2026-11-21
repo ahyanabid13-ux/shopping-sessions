@@ -510,6 +510,10 @@ pub fn run() {
         })
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
+    if verbose {
+        let total: usize = order.iter().map(|o| o.0).sum();
+        eprintln!("    partitions {}: largest {:?}, total {total}", order.len(), &order.iter().take(6).map(|o| o.0).collect::<Vec<_>>());
+    }
     let next = AtomicUsize::new(0);
     let user_dir = out_dir.join("user_daily");
     let campaign_dir = out_dir.join("campaign_daily");
@@ -535,7 +539,11 @@ pub fn run() {
         }
         // Each thread writes its own user_daily file as soon as it is done.
         if !out.rows.is_empty() {
+            let tw = Instant::now();
             output::write_user_daily(&user_dir.join(format!("part-{t:03}.parquet")), &out, &ctx, &link_table, &products);
+            if verbose {
+                eprintln!("    write_user_daily[{t}]: {} rows, {:.1} ms", out.rows.len(), tw.elapsed().as_secs_f64() * 1e3);
+            }
         }
         out
     });
@@ -547,4 +555,11 @@ pub fn run() {
     }
     output::write_campaign_daily(&campaign_dir.join("part-000.parquet"), &outs, &ctx, &campaigns);
     lap("write");
+    if verbose {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("VmRSS")) {
+                eprintln!("{line}");
+            }
+        }
+    }
 }

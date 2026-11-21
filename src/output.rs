@@ -5,45 +5,58 @@ use std::path::Path;
 use crate::ids;
 use crate::links::{LinkTable, LINKED};
 use crate::lookup::{Campaigns, Products};
-use crate::parquet::{self, Column};
+use crate::parquet::{self, Chunk, Column, Kind};
 use crate::person::{self, NO_CATEGORY};
 
 pub fn write_user_daily(path: &Path, out: &person::Out, ctx: &person::Ctx, links: &LinkTable, products: &Products) {
-    let n = out.rows.len();
-    let mut names: Vec<u8> = Vec::with_capacity(n * 10);
-    let mut name_ends: Vec<u32> = Vec::with_capacity(n);
-    let mut days: Vec<i32> = Vec::with_capacity(n);
-    let mut sessions: Vec<i32> = Vec::with_capacity(n);
-    let mut events: Vec<i32> = Vec::with_capacity(n);
-    let mut revenue: Vec<i64> = Vec::with_capacity(n);
-    let mut cats: Vec<u8> = Vec::with_capacity(n * 6);
-    let mut cat_ends: Vec<u32> = Vec::with_capacity(n);
-    let mut present: Vec<bool> = Vec::with_capacity(n);
-    for r in &out.rows {
-        let user_key = if r.pk & LINKED != 0 { links.names[(r.pk & !LINKED) as usize] } else { r.pk };
-        ids::write_id(&mut names, user_key, b'u', ctx.odd);
-        name_ends.push(names.len() as u32);
-        days.push((ctx.first_day + r.day as i64) as i32);
-        sessions.push(r.sessions as i32);
-        events.push(r.events as i32);
-        revenue.push(r.revenue as i64);
-        if r.top != NO_CATEGORY {
-            cats.extend_from_slice(&products.categories[r.top as usize]);
-            present.push(true);
-        } else {
-            present.push(false);
+    let rows = &out.rows;
+    let n = rows.len();
+    // Each column's PLAIN page body, built in one pass over the rows.
+    let mut user: Vec<u8> = Vec::with_capacity(n * 14);
+    let mut days: Vec<u8> = Vec::with_capacity(n * 4);
+    let mut sessions: Vec<u8> = Vec::with_capacity(n * 4);
+    let mut events: Vec<u8> = Vec::with_capacity(n * 4);
+    let mut revenue: Vec<u8> = Vec::with_capacity(n * 8);
+    let mut levels = parquet::Levels::new(n);
+    let mut cats: Vec<u8> = Vec::with_capacity(n * 12);
+    let encoded_categories: Vec<Vec<u8>> = products
+        .categories
+        .iter()
+        .map(|c| {
+            let mut v = Vec::new();
+            parquet::put_str(&mut v, c);
+            v
+        })
+        .collect();
+    let mut name_buf: Vec<u8> = Vec::with_capacity(64);
+    // A person's rows are consecutive: its name is written once.
+    let mut previous = u64::MAX;
+    for (i, r) in rows.iter().enumerate() {
+        if r.pk != previous {
+            previous = r.pk;
+            let user_key = if r.pk & LINKED != 0 { links.names[(r.pk & !LINKED) as usize] } else { r.pk };
+            name_buf.clear();
+            ids::write_id(&mut name_buf, user_key, b'u', ctx.odd);
         }
-        cat_ends.push(cats.len() as u32);
+        parquet::put_str(&mut user, &name_buf);
+        days.extend_from_slice(&((ctx.first_day + r.day as i64) as i32).to_le_bytes());
+        sessions.extend_from_slice(&(r.sessions as i32).to_le_bytes());
+        events.extend_from_slice(&(r.events as i32).to_le_bytes());
+        revenue.extend_from_slice(&(r.revenue as i64).to_le_bytes());
+        if r.top != NO_CATEGORY {
+            levels.set(i);
+            cats.extend_from_slice(&encoded_categories[r.top as usize]);
+        }
     }
-    let columns = [
-        Column::Str { name: "user_id", values: &names, ends: &name_ends },
-        Column::I32 { name: "day", values: &days, date: true },
-        Column::I32 { name: "sessions", values: &sessions, date: false },
-        Column::I32 { name: "events", values: &events, date: false },
-        Column::I64 { name: "revenue_cents", values: &revenue },
-        Column::OptStr { name: "top_category", values: &cats, ends: &cat_ends, present: &present },
+    let chunks = [
+        Chunk { name: "user_id", kind: Kind::Str, parts: vec![&user] },
+        Chunk { name: "day", kind: Kind::Date, parts: vec![&days] },
+        Chunk { name: "sessions", kind: Kind::I32, parts: vec![&sessions] },
+        Chunk { name: "events", kind: Kind::I32, parts: vec![&events] },
+        Chunk { name: "revenue_cents", kind: Kind::I64, parts: vec![&revenue] },
+        Chunk { name: "top_category", kind: Kind::OptStr, parts: vec![levels.bytes(), &cats] },
     ];
-    parquet::write_file(path, &columns).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    parquet::write_chunks(path, n, &chunks).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 pub fn write_campaign_daily(path: &Path, outs: &[person::Out], ctx: &person::Ctx, campaigns: &Campaigns) {
