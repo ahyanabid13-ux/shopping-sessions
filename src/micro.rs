@@ -133,3 +133,56 @@ pub fn run(path: &str) {
         acc
     });
 }
+
+/// Scatter and table-lookup costs in isolation.
+pub fn run_parts() {
+    use crate::scatter::Scatter;
+    use crate::util::{fib, take};
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct R {
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+    }
+    let n = 4_000_000usize;
+    let keys: Vec<u64> = (0..n as u64).map(|i| fib(i ^ 0x5555)).collect();
+    for bits in [10u32, 12, 13] {
+        let t = Instant::now();
+        let mut sc: Scatter<R> = Scatter::new(1 << bits, 3 * n);
+        for &k in &keys {
+            sc.push(take(k, 0, bits), R { a: k, b: k, c: k, d: k });
+        }
+        sc.finish();
+        let first = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        for &k in &keys {
+            sc.push(take(k, 0, bits), R { a: k, b: k, c: k, d: k });
+        }
+        sc.finish();
+        eprintln!("scatter 32B, {:5} parts: first {:5.2} ns/rec, warm {:5.2} ns/rec", 1 << bits, first * 1e9 / n as f64, t.elapsed().as_secs_f64() * 1e9 / n as f64);
+    }
+    for mb in [16usize, 64, 256] {
+        let slots = mb << 17; // 8-byte slots
+        let table: Vec<u64> = (0..slots as u64).map(|i| i.wrapping_mul(0x9E37)).collect();
+        let mask = slots - 1;
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for &k in &keys {
+            acc = acc.wrapping_add(table[(k as usize) & mask]);
+        }
+        let plain = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut acc2 = 0u64;
+        for i in 0..n {
+            if i + 16 < n {
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(table.as_ptr().add((keys[i + 16] as usize) & mask) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                }
+            }
+            acc2 = acc2.wrapping_add(table[(keys[i] as usize) & mask]);
+        }
+        eprintln!("lookup {mb:4} MB table: plain {:5.2} ns, prefetched {:5.2} ns ({})", plain * 1e9 / n as f64, t.elapsed().as_secs_f64() * 1e9 / n as f64, acc ^ acc2);
+    }
+}

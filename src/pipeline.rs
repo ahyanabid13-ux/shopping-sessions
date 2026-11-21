@@ -17,15 +17,13 @@ use crate::links::{self, LinkTable, PERSON_MASK};
 use crate::lookup::{self, Campaigns, Products, NOT_A_CAMPAIGN};
 use crate::output;
 use crate::person::{self, Ck2, Ev2, REACH_MS};
-use crate::scatter::{Scatter, CHUNK};
+use crate::scatter::Scatter;
 use crate::ts::DAY;
 use crate::util::{fib, par_run, take, thread_count, Mmap};
 
 const LATE_MS: i64 = 86_400_000;
 const MAX_PRICE: u64 = 10_000_000;
 const SEGMENT: usize = 2 << 20;
-/// Lines between a person-table prefetch and its use.
-const RING: usize = 16;
 /// User keys use the low 47 bits of a pending record's `pk`.
 const USER_MASK: u64 = (1 << ids::KEY_BITS) - 1;
 
@@ -93,42 +91,6 @@ fn first_line(data: &[u8], start: usize) -> usize {
     }
 }
 
-/// Calls `f(data, fs, fe)` with the unquoted fields of every well-formed
-/// `N`-field line owned by the segment.
-#[inline(always)]
-fn for_each_record<const N: usize>(data: &[u8], seg: &Segment, mut f: impl FnMut(&[usize; N], &[usize; N])) {
-    let len = data.len();
-    let mut pos = first_line(data, seg.start);
-    let mut fs = [0usize; N];
-    let mut fe = [0usize; N];
-    // Fast path while a full 128-byte window is readable.
-    let fast_end = seg.end.min(len.saturating_sub(128));
-    while pos < fast_end {
-        match fast::scan_window::<N>(data, pos, &mut fs, &mut fe) {
-            fast::Window::Line { end, ok } => {
-                if ok {
-                    f(&fs, &fe);
-                }
-                pos = end + 1;
-            }
-            fast::Window::Long => {
-                let (end, n, quotes) = fast::scan::<N>(data, pos, &mut fs, &mut fe);
-                if n == N && fast::unquote::<N>(data, &mut fs, &mut fe, quotes) {
-                    f(&fs, &fe);
-                }
-                pos = end + 1;
-            }
-        }
-    }
-    while pos < seg.end && pos < len {
-        let (end, n, quotes) = fast::scan::<N>(data, pos, &mut fs, &mut fe);
-        if n == N && fast::unquote::<N>(data, &mut fs, &mut fe, quotes) {
-            f(&fs, &fe);
-        }
-        pos = end + 1;
-    }
-}
-
 struct Parser<'a> {
     window_start: i64,
     window_end: i64,
@@ -184,10 +146,22 @@ impl Parser<'_> {
         if t < self.window_start || t >= self.window_end {
             return Some(rec);
         }
-        let etype = &d[fs[4]..fe[4]];
-        let purchase = match etype {
-            b"view" | b"cart" => false,
-            b"purchase" => true,
+        // event_type is exactly view, cart or purchase: fixed-width compares.
+        let purchase = match fe[4] - fs[4] {
+            4 => {
+                let w = unsafe { (d.as_ptr().add(fs[4]) as *const u32).read_unaligned() };
+                if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
+                    return Some(rec);
+                }
+                false
+            }
+            8 => {
+                let w = unsafe { (d.as_ptr().add(fs[4]) as *const u64).read_unaligned() };
+                if w != u64::from_le_bytes(*b"purchase") {
+                    return Some(rec);
+                }
+                true
+            }
             _ => return Some(rec),
         };
         let mut amount = 0u64;
@@ -222,7 +196,7 @@ impl Parser<'_> {
         }
         let key = self.key(d, fs[0], fe[0], b'k');
         let user = self.key(d, fs[1], fe[1], b'u');
-        Some(Ck2 { pk: user, key, t: (t - self.base) as u32, campaign: c })
+        Some(Ck2 { pk: user, key, t: (t - self.base) as u32, campaign: c, _pad: 0 })
     }
 }
 
@@ -232,42 +206,86 @@ fn partition_bits(rows: usize, per_partition: usize) -> u32 {
     wanted.trailing_zeros().clamp(4, 14)
 }
 
-/// Delays each record by RING pushes so its person-table slot can be
-/// prefetched first.
-struct Ring<T: Copy + Default> {
-    items: [T; RING],
-    written: usize,
-    read: usize,
+/// Records whose person-table slot was prefetched, resolved in one go.
+const BATCH: usize = 32;
+
+/// Lines of one segment, through the window fast path when possible.
+/// Calls `f(fs, fe)` for every well-formed line with N fields.
+#[inline(always)]
+fn lines<const N: usize>(d: &[u8], seg: &Segment, mut f: impl FnMut(&[usize; N], &[usize; N])) {
+    let len = d.len();
+    let mut pos = first_line(d, seg.start);
+    let fast_end = seg.end.min(len.saturating_sub(128));
+    let mut fs = [0usize; N];
+    let mut fe = [0usize; N];
+    while pos < seg.end && pos < len {
+        let (end, ok) = match if pos < fast_end { fast::scan_window::<N>(d, pos, &mut fs, &mut fe) } else { fast::Window::Long } {
+            fast::Window::Line { end, ok } => (end, ok),
+            fast::Window::Long => {
+                let (end, n, quotes) = fast::scan::<N>(d, pos, &mut fs, &mut fe);
+                (end, n == N && fast::unquote::<N>(d, &mut fs, &mut fe, quotes))
+            }
+        };
+        if ok {
+            f(&fs, &fe);
+        }
+        pos = end + 1;
+    }
 }
 
-impl<T: Copy + Default> Ring<T> {
-    fn new() -> Self {
-        Ring { items: [T::default(); RING], written: 0, read: 0 }
+impl Parser<'_> {
+    /// Parses one events segment into `out` (partitioned by event key).
+    #[inline(never)]
+    fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
+        let mut batch = [Ev1::default(); BATCH];
+        let mut n = 0usize;
+        let flush = |batch: &[Ev1], out: &mut Scatter<Ev1>| {
+            for rec in batch {
+                let mut r = *rec;
+                r.pk = links.person_of(r.pk & USER_MASK) | (r.pk & !PERSON_MASK);
+                out.push(take(fib(r.key), 0, bits1), r);
+            }
+        };
+        lines::<7>(d, seg, |fs, fe| {
+            let Some(rec) = self.event(d, fs, fe) else { return };
+            if rec.tp & VALID == 0 {
+                out.push(take(fib(rec.key), 0, bits1), rec);
+                return;
+            }
+            links.prefetch(rec.pk & USER_MASK);
+            batch[n] = rec;
+            n += 1;
+            if n == BATCH {
+                flush(&batch, out);
+                n = 0;
+            }
+        });
+        flush(&batch[..n], out);
     }
 
-    /// Adds `item`; returns the oldest one once the ring is full.
-    #[inline(always)]
-    fn push(&mut self, item: T) -> Option<T> {
-        self.items[self.written % RING] = item;
-        self.written += 1;
-        if self.written - self.read == RING {
-            let out = self.items[self.read % RING];
-            self.read += 1;
-            Some(out)
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    fn pop(&mut self) -> Option<T> {
-        if self.read < self.written {
-            let out = self.items[self.read % RING];
-            self.read += 1;
-            Some(out)
-        } else {
-            None
-        }
+    /// Parses one clicks segment into `out` (partitioned by person).
+    #[inline(never)]
+    fn clicks_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
+        let mut batch = [Ck2::default(); BATCH];
+        let mut n = 0usize;
+        let flush = |batch: &[Ck2], out: &mut Scatter<Ck2>| {
+            for c in batch {
+                let mut c = *c;
+                c.pk = links.person_of(c.pk);
+                out.push(take(fib(c.pk), 0, bits2), c);
+            }
+        };
+        lines::<4>(d, seg, |fs, fe| {
+            let Some(c) = self.click(d, fs, fe) else { return };
+            links.prefetch(c.pk);
+            batch[n] = c;
+            n += 1;
+            if n == BATCH {
+                flush(&batch, out);
+                n = 0;
+            }
+        });
+        flush(&batch[..n], out);
     }
 }
 
@@ -335,7 +353,7 @@ pub fn run() {
             let at = next.fetch_add(1, Ordering::Relaxed);
             let Some(seg) = link_segments.get(at) else { break };
             let d = maps[seg.file].bytes();
-            for_each_record::<2>(d, seg, |fs, fe| {
+            lines::<2>(d, seg, |fs, fe| {
                 if fs[0] != fe[0] && fs[1] != fe[1] {
                     pairs.push((parser.key(d, fs[0], fe[0], b'u'), parser.key(d, fs[1], fe[1], b'u')));
                 }
@@ -351,16 +369,19 @@ pub fn run() {
     // Internal profiling aid: SESSIONS_BENCH=1 scans lines only, =2 also
     // parses event fields; both stop after the parse phase.
     if let Some(mode) = std::env::var("SESSIONS_BENCH").ok().and_then(|v| v.parse::<u32>().ok()) {
+        if mode == 0 {
+            return;
+        }
         let next = AtomicUsize::new(0);
         let work: Vec<&Segment> = event_segments.iter().collect();
         let counts: Vec<(usize, u64)> = par_run(threads, |_| {
-            let (mut lines, mut acc) = (0usize, 0u64);
+            let (mut count, mut acc) = (0usize, 0u64);
             loop {
                 let at = next.fetch_add(1, Ordering::Relaxed);
                 let Some(seg) = work.get(at) else { break };
                 let d = maps[seg.file].bytes();
-                for_each_record::<7>(d, seg, |fs, fe| {
-                    lines += 1;
+                lines::<7>(d, seg, |fs, fe| {
+                    count += 1;
                     if mode >= 2 {
                         if let Some(rec) = parser.event(d, fs, fe) {
                             acc = acc.wrapping_add(rec.key ^ rec.pk ^ rec.tp);
@@ -370,7 +391,7 @@ pub fn run() {
                     }
                 });
             }
-            (lines, acc)
+            (count, acc)
         });
         lap("bench");
         eprintln!("bench mode {mode}: {} lines, {}", counts.iter().map(|c| c.0).sum::<usize>(), counts.iter().map(|c| c.1).fold(0, u64::wrapping_add));
@@ -381,58 +402,28 @@ pub fn run() {
     // Rough line counts size the partitions: ~80 bytes per event line, ~45 per click line.
     let est_events = event_bytes / 80 + 1;
     let est_clicks = click_bytes / 45 + 1;
-    let bits1 = partition_bits(est_events, 12_288);
-    let bits2 = partition_bits(est_events + est_clicks, 12_288);
+    // Partitions small enough that the dedup and person tables stay in a
+    // 1 MiB L2 (the scorers' Cascade Lake cores).
+    let bits1 = partition_bits(est_events, 6_144);
+    let bits2 = partition_bits(est_events + est_clicks, 8_192);
     let (p1, p2) = (1usize << bits1, 1usize << bits2);
     let work: Vec<&Segment> = event_segments.iter().chain(&click_segments).collect();
     let next = AtomicUsize::new(0);
     let parsed: Vec<(Scatter<Ev1>, Scatter<Ck2>)> = par_run(threads, |_| {
         let mut evs: Scatter<Ev1> = Scatter::new(p1, est_events / threads + 1);
         let mut cks: Scatter<Ck2> = Scatter::new(p2, est_clicks / threads + 1);
-        let mut ev_ring: Ring<Ev1> = Ring::new();
-        let mut ck_ring: Ring<Ck2> = Ring::new();
-        let finish_event = |evs: &mut Scatter<Ev1>, mut rec: Ev1| {
-            rec.pk = link_table.person_of(rec.pk & USER_MASK) | (rec.pk & !PERSON_MASK);
-            evs.push(take(fib(rec.key), 0, bits1), rec);
-        };
-        let finish_click = |cks: &mut Scatter<Ck2>, mut c: Ck2| {
-            c.pk = link_table.person_of(c.pk);
-            cks.push(take(fib(c.pk), 0, bits2), c);
-        };
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
             let Some(seg) = work.get(at) else { break };
             let d = maps[seg.file].bytes();
             if seg.file < n_ev {
-                for_each_record::<7>(d, seg, |fs, fe| {
-                    if let Some(rec) = parser.event(d, fs, fe) {
-                        if rec.tp & VALID == 0 {
-                            evs.push(take(fib(rec.key), 0, bits1), rec);
-                        } else {
-                            link_table.prefetch(rec.pk & USER_MASK);
-                            if let Some(ready) = ev_ring.push(rec) {
-                                finish_event(&mut evs, ready);
-                            }
-                        }
-                    }
-                });
+                parser.events_segment(d, seg, &link_table, bits1, &mut evs);
             } else {
-                for_each_record::<4>(d, seg, |fs, fe| {
-                    if let Some(c) = parser.click(d, fs, fe) {
-                        link_table.prefetch(c.pk);
-                        if let Some(ready) = ck_ring.push(c) {
-                            finish_click(&mut cks, ready);
-                        }
-                    }
-                });
+                parser.clicks_segment(d, seg, &link_table, bits2, &mut cks);
             }
         }
-        while let Some(rec) = ev_ring.pop() {
-            finish_event(&mut evs, rec);
-        }
-        while let Some(c) = ck_ring.pop() {
-            finish_click(&mut cks, c);
-        }
+        evs.finish();
+        cks.finish();
         (evs, cks)
     });
     lap("parse");
@@ -494,6 +485,7 @@ pub fn run() {
                 slot.key = 0;
             }
         }
+        out.finish();
         out
     });
     lap("dedup");

@@ -1,22 +1,23 @@
 //! IDs as 64-bit keys.
 //!
 //! Every ID the generator writes is one prefix letter and 1 to 8 base-36
-//! digits (`e…`, `u…`, `k…`). Those become a "fast" key: digit count in bits
-//! 42..46 and the digits' base-36 value below. Any other string (upper-case
-//! variants, spaces, carriage returns, anything) is interned and becomes an
-//! "odd" key: bit 46 plus its index in the interner. Both forms are
-//! injective, so two IDs are equal exactly when their keys are equal, and
-//! every key turns back into its exact original bytes.
+//! digits (`e…`, `u…`, `k…`). Those become a "fast" key: a dense number over
+//! all digit strings (every 1-digit string, then every 2-digit one, ...)
+//! plus one, so it is never 0. Any other string (upper-case variants,
+//! spaces, carriage returns, anything) is interned and becomes an "odd" key:
+//! bit 42 plus its index in the interner. Both forms are injective, below
+//! 2^43, and turn back into the exact original bytes.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub const ODD: u64 = 1 << 46;
-/// Keys use the low 47 bits.
-pub const KEY_BITS: u32 = 47;
-pub const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
-const VALUE_MASK: u64 = (1 << 42) - 1;
+pub const ODD: u64 = 1 << 42;
+/// Keys use the low 43 bits.
+pub const KEY_BITS: u32 = 43;
+
+/// OFFSET[d]: how many digit strings are shorter than d digits.
+pub const OFFSET: [u64; 9] = [0, 0, 36, 1_332, 47_988, 1_727_604, 62_193_780, 2_238_976_116, 80_603_140_212];
 
 static DIGIT_VALUE: [u8; 256] = {
     let mut table = [255u8; 256];
@@ -32,6 +33,24 @@ static DIGIT_VALUE: [u8; 256] = {
     }
     table
 };
+
+/// The fast key of `digits` base-36 digits with value `value`.
+#[inline(always)]
+pub fn fast_from(digits: usize, value: u64) -> u64 {
+    debug_assert!((1..=8).contains(&digits));
+    unsafe { *OFFSET.get_unchecked(digits) + value + 1 }
+}
+
+/// (digit count, value) of a fast key.
+#[inline]
+fn fast_parts(key: u64) -> (usize, u64) {
+    let k = key - 1;
+    let mut d = 8;
+    while OFFSET[d] > k {
+        d -= 1;
+    }
+    (d, k - OFFSET[d])
+}
 
 /// The fast key of `b` when it is `prefix` and 1..=8 base-36 digits, else 0.
 #[inline(always)]
@@ -51,7 +70,7 @@ pub fn fast_key(b: &[u8], prefix: u8) -> u64 {
     if bad & 0x80 != 0 {
         return 0;
     }
-    (((n - 1) as u64) << 42) | value
+    fast_from(n - 1, value)
 }
 
 /// Thread-safe store of the "odd" ID strings. Rare by construction.
@@ -106,8 +125,7 @@ pub fn write_id(out: &mut Vec<u8>, key: u64, prefix: u8, odd: &[Vec<u8>]) {
         return;
     }
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let len = ((key >> 42) & 15) as usize;
-    let mut value = key & VALUE_MASK;
+    let (len, mut value) = fast_parts(key);
     let mut buf = [b'0'; 8];
     for slot in buf[..len].iter_mut().rev() {
         *slot = DIGITS[(value % 36) as usize];
@@ -138,9 +156,9 @@ pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &[Vec<u8>]) -> Ordering {
         // Same prefix: compare the digit strings. Padding each with '0' (the
         // smallest digit) to 8 digits keeps lexicographic order; on a tie the
         // shorter string is a prefix of the longer one and sorts first.
-        let (la, lb) = ((a >> 42) & 15, (b >> 42) & 15);
-        let pa = (a & VALUE_MASK) * POW36[(8 - la) as usize];
-        let pb = (b & VALUE_MASK) * POW36[(8 - lb) as usize];
+        let ((la, va), (lb, vb)) = (fast_parts(a), fast_parts(b));
+        let pa = va * POW36[8 - la];
+        let pb = vb * POW36[8 - lb];
         return pa.cmp(&pb).then(la.cmp(&lb));
     }
     let mut sa = Vec::with_capacity(16);
@@ -159,7 +177,8 @@ mod tests {
         let interner = Interner::new();
         let ids: Vec<&[u8]> = vec![
             b"u1", b"u10", b"u9", b"u0", b"u00", b"u000a", b"uzzzzzzzz", b"u00000000", b"U1", b"u1 ", b" u1",
-            b"u", b"uA", b"u123456789", b"e1", b"\tB", b"u0a", b"u0",
+            b"u", b"uA", b"u123456789", b"e1", b"\tB", b"u0a", b"u0", b"uzzzzzzz", b"u0000000", b"u10000000",
+            b"uz", b"u00", b"u0z",
         ];
         let keys: Vec<u64> = ids.iter().map(|s| key_of(s, b'u', &interner)).collect();
         let odd = interner.snapshot();

@@ -93,10 +93,24 @@ pub enum Window {
     Long,
 }
 
+/// Bits of `x` selected by the 128-bit mask (lo, hi), packed in order.
+#[inline(always)]
+fn pext2(x0: u64, x1: u64, m0: u64, m1: u64) -> u64 {
+    unsafe { _pext_u64(x0, m0) | _pext_u64(x1, m1).unbounded_shl(m0.count_ones()) }
+}
+
 /// Splits the line at `start` when it fits in the 128-byte window
 /// `data[start..start + 128]`, which the caller guarantees is readable.
-/// Branch-light: newline, comma and quote masks for the window, exactly
-/// N-1 comma extractions, and branchless unquoting.
+///
+/// Newline, comma and quote masks cover the window as two 64-bit halves.
+/// Each field boundary is found independently (the i-th comma is
+/// `tzcnt(pdep(1 << i, commas))`), and quotes are checked with bit
+/// operations: `pext` gathers, per field, whether its first and its last
+/// byte is a quote. A line is well formed when every quote is one end of a
+/// wrapping pair, i.e. quotes == 2 x wrapped fields.
+///
+/// A line whose first field is empty reports `ok == false`: such a line is
+/// dropped by every caller (empty event_id, click_id or link side).
 #[inline(always)]
 pub fn scan_window<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
     debug_assert!(start + 128 <= data.len());
@@ -104,39 +118,44 @@ pub fn scan_window<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N
         let p = data.as_ptr().add(start);
         let (nl0, cm0, q0) = masks64(p);
         let (nl1, cm1, q1) = masks64(p.add(64));
-        let nl = nl0 as u128 | (nl1 as u128) << 64;
-        if nl == 0 {
+        if nl0 | nl1 == 0 {
             return Window::Long;
         }
-        let end_rel = nl.trailing_zeros() as usize;
-        let keep = (1u128 << end_rel) - 1;
-        let c = (cm0 as u128 | (cm1 as u128) << 64) & keep;
-        let quotes = ((q0 as u128 | (q1 as u128) << 64) & keep).count_ones();
-        let end = start + end_rel;
-        if c.count_ones() as usize != N - 1 {
+        let e = if nl0 != 0 { nl0.trailing_zeros() } else { 64 + nl1.trailing_zeros() };
+        let end = start + e as usize;
+        // Keep bits below the newline (bzhi leaves everything for index >= 64).
+        let k0 = _bzhi_u64(u64::MAX, e);
+        let k1 = _bzhi_u64(u64::MAX, e.saturating_sub(64));
+        let (c0, c1, q0, q1) = (cm0 & k0, cm1 & k1, q0 & k0, q1 & k1);
+        let n0 = c0.count_ones();
+        if n0 + c1.count_ones() != (N - 1) as u32 || c0 & 1 != 0 || e == 0 {
             return Window::Line { end, ok: false };
         }
-        let mut m = c;
+        // Field starts: 0 and after each comma. Field last bytes: before each
+        // comma and before the newline. A field starting and ending on the
+        // same byte is a one-byte field (a lone quote is not a wrapper).
+        let s0 = 1 | (c0 << 1);
+        let s1 = (c1 << 1) | (c0 >> 63);
+        let last = e - 1;
+        let lbit = 1u64 << (last & 63);
+        let l0 = (c0 >> 1) | (c1 << 63) | if last < 64 { lbit } else { 0 };
+        let l1 = (c1 >> 1) | if last >= 64 { lbit } else { 0 };
+        let wrapped = pext2(q0, q1, s0, s1) & pext2(q0, q1, l0, l1) & !pext2(s0 & l0, s1 & l1, s0, s1);
+        let ok = q0.count_ones() + q1.count_ones() == 2 * wrapped.count_ones();
         let mut cur = start;
         for i in 0..N - 1 {
-            let at = start + m.trailing_zeros() as usize;
-            fs[i] = cur;
-            fe[i] = at;
+            let lo = _pdep_u64(1u64 << i, c0).trailing_zeros();
+            let hi = 64 + _pdep_u64(1u64 << ((i as u32).wrapping_sub(n0) & 63), c1).trailing_zeros();
+            let at = start + if (i as u32) < n0 { lo } else { hi } as usize;
+            let w = ((wrapped >> i) & 1) as usize;
+            fs[i] = cur + w;
+            fe[i] = at - w;
             cur = at + 1;
-            m &= m - 1;
         }
-        fs[N - 1] = cur;
-        fe[N - 1] = end;
-        let mut wrapped = 0u32;
-        for i in 0..N {
-            let (s, e) = (fs[i], fe[i]);
-            // e >= 1: a data line always follows the header line.
-            let w = ((e - s >= 2) & (*data.get_unchecked(s) == b'"') & (*data.get_unchecked(e - 1) == b'"')) as usize;
-            fs[i] = s + w;
-            fe[i] = e - w;
-            wrapped += w as u32;
-        }
-        Window::Line { end, ok: quotes == 2 * wrapped }
+        let w = ((wrapped >> (N - 1)) & 1) as usize;
+        fs[N - 1] = cur + w;
+        fe[N - 1] = end - w;
+        Window::Line { end, ok }
     }
 }
 
@@ -173,7 +192,7 @@ pub fn id_key(data: &[u8], s: usize, e: usize, prefix: u8) -> u64 {
     let digits = n - 1;
     unsafe {
         let w = (data.as_ptr().add(e - 8) as *const u64).read_unaligned();
-        let keep: u64 = if digits == 8 { !0 } else { !((1u64 << (8 * (8 - digits))) - 1) };
+        let keep: u64 = u64::MAX << (64 - 8 * digits);
         let w = (w & keep) | (0x3030_3030_3030_3030 & !keep);
         let v = _mm_cvtsi64_si128(w as i64);
         let dig = _mm_and_si128(
@@ -192,7 +211,7 @@ pub fn id_key(data: &[u8], s: usize, e: usize, prefix: u8) -> u64 {
         let quads = _mm_madd_epi16(pairs, _mm_setr_epi16(1296, 1, 1296, 1, 0, 0, 0, 0));
         let hi = _mm_cvtsi128_si32(quads) as u32 as u64;
         let lo = _mm_extract_epi32::<1>(quads) as u32 as u64;
-        ((digits as u64) << 42) | (hi * 1_679_616 + lo)
+        crate::ids::fast_from(digits, hi * 1_679_616 + lo)
     }
 }
 
@@ -529,8 +548,8 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let alphabet = b"ab,\"\r 9,,\"xyz0123";
-        for _ in 0..300_000 {
+        let alphabet = b"ab,\"\r 9,,\"xyz0123\"\",";
+        for _ in 0..1_000_000 {
             let len = (rnd() % 140) as usize;
             let mut line: Vec<u8> = (0..len).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]).collect();
             if rnd() % 3 == 0 {
@@ -549,15 +568,21 @@ mod tests {
                 Window::Line { end, ok } => {
                     assert!(line.len() < 128);
                     assert_eq!(end, 7 + line.len());
-                    let got = ok.then(|| (0..7).map(|i| data[fs[i]..fe[i]].to_vec()).collect::<Vec<_>>());
-                    assert_eq!(got, scan_ref::<7>(&line), "{:?}", String::from_utf8_lossy(&line));
+                    let got = ok
+                        .then(|| (0..7).map(|i| data[fs[i]..fe[i]].to_vec()).collect::<Vec<_>>())
+                        .filter(|f| !f[0].is_empty());
+                    // Lines whose first field is empty are dropped by every caller.
+                    let want = scan_ref::<7>(&line).filter(|f| !f[0].is_empty());
+                    assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&line));
                 }
             }
             let mut fs = [0usize; 2];
             let mut fe = [0usize; 2];
             if let Window::Line { ok, .. } = scan_window::<2>(&data, 7, &mut fs, &mut fe) {
-                let got = ok.then(|| (0..2).map(|i| data[fs[i]..fe[i]].to_vec()).collect::<Vec<_>>());
-                assert_eq!(got, scan_ref::<2>(&line));
+                let got = ok
+                    .then(|| (0..2).map(|i| data[fs[i]..fe[i]].to_vec()).collect::<Vec<_>>())
+                    .filter(|f| !f[0].is_empty());
+                assert_eq!(got, scan_ref::<2>(&line).filter(|f| !f[0].is_empty()), "{:?}", String::from_utf8_lossy(&line));
             }
         }
     }

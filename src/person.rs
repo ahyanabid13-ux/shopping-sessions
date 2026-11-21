@@ -17,7 +17,9 @@ pub struct Ev2 {
     pub price: u32,
 }
 
-/// A valid click: person key, click key (for ties), time since `base`, campaign index (1..).
+/// A valid click: person key, click key (for ties), time since `base`,
+/// campaign index (1..). Padded to 32 bytes for the scatter's cache-line
+/// staging.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Ck2 {
@@ -25,6 +27,7 @@ pub struct Ck2 {
     pub key: u64,
     pub t: u32,
     pub campaign: u32,
+    pub _pad: u64,
 }
 
 pub const NO_CATEGORY: u16 = u16::MAX;
@@ -79,11 +82,19 @@ impl Out {
 /// Reusable per-thread buffers.
 #[derive(Default)]
 pub struct Scratch {
-    keys: Vec<u64>,
-    ids: Vec<u32>,
+    /// Person table: (person key, local id, epoch). A slot whose epoch is not
+    /// the current partition's is empty, so the table is never cleared.
+    table: Vec<(u64, u32, u32)>,
+    epoch: u32,
     ev_person: Vec<u32>,
     ev_start: Vec<u32>,
-    evs: Vec<Ev2>,
+    /// Person key of each local id.
+    person_keys: Vec<u64>,
+    fill: Vec<u32>,
+    /// Each person's events as `t << 32 | purchase`, purchase being 0 or
+    /// 1 + an index into `purchases`.
+    keys: Vec<u64>,
+    purchases: Vec<(u32, u16)>,
     ck_start: Vec<u32>,
     ck_person: Vec<u32>,
     cks: Vec<Ck2>,
@@ -93,9 +104,22 @@ pub struct Scratch {
     category_sums: Vec<(u16, u64)>,
 }
 
+/// Turns counts into start offsets, with one extra entry for the end.
+#[inline]
+fn offsets(counts: &mut Vec<u32>) -> u32 {
+    let mut acc = 0u32;
+    for c in counts.iter_mut() {
+        let n = *c;
+        *c = acc;
+        acc += n;
+    }
+    counts.push(acc);
+    acc
+}
+
 /// Processes one partition: `events` and `clicks` are the slices every
-/// thread scattered into it.
-/// `skip` is the number of top hash bits that chose this partition.
+/// thread scattered into it. `skip` is the number of top hash bits that
+/// chose this partition.
 pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &mut Scratch, out: &mut Out) {
     let n_ev: usize = events.iter().map(|x| x.len()).sum();
     if n_ev == 0 {
@@ -106,57 +130,72 @@ pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &m
         s.position = vec![0; ctx.campaigns];
     }
 
-    // Local dense person ids.
-    let cap = (n_ev * 2).max(16).next_power_of_two();
+    // Local dense person ids, from an epoch-stamped table at load <= 2/3.
+    let cap = (n_ev + n_ev / 2).max(16).next_power_of_two();
+    if s.table.len() < cap {
+        s.table.clear();
+        s.table.resize(cap, (0, 0, 0));
+        s.epoch = 0;
+    }
+    s.epoch += 1;
+    let epoch = s.epoch;
     let mask = cap - 1;
     let tbits = cap.trailing_zeros();
-    s.keys.clear();
-    s.keys.resize(cap, 0);
-    s.ids.resize(cap, 0);
+    let table = &mut s.table[..cap];
     s.ev_person.clear();
     s.ev_person.reserve(n_ev);
     s.ev_start.clear();
+    s.person_keys.clear();
+    let first_row = out.rows.len();
     let mut persons = 0u32;
     for slice in events {
         for e in slice.iter() {
             let k = e.pk & PERSON_MASK;
             let mut h = take(fib(k), skip, tbits);
             let id = loop {
-                let cur = s.keys[h];
-                if cur == k {
-                    break s.ids[h];
-                }
-                if cur == 0 {
-                    s.keys[h] = k;
-                    s.ids[h] = persons;
+                let slot = unsafe { table.get_unchecked_mut(h) };
+                if slot.2 != epoch {
+                    *slot = (k, persons, epoch);
                     persons += 1;
                     s.ev_start.push(0);
+                    s.person_keys.push(k);
                     break persons - 1;
+                }
+                if slot.0 == k {
+                    break slot.1;
                 }
                 h = (h + 1) & mask;
             };
-            s.ev_start[id as usize] += 1;
+            unsafe { *s.ev_start.get_unchecked_mut(id as usize) += 1 };
             s.ev_person.push(id);
         }
     }
-    // Counts to start offsets (one extra slot for the end).
-    let mut acc = 0u32;
-    for c in s.ev_start.iter_mut() {
-        let n = *c;
-        *c = acc;
-        acc += n;
-    }
-    s.ev_start.push(acc);
-    s.evs.clear();
-    s.evs.resize(n_ev, Ev2::default());
+    offsets(&mut s.ev_start);
+
+    // Group the events by person as sort keys; purchases keep their price and
+    // category on the side.
+    s.purchases.clear();
+    s.keys.clear();
+    s.keys.reserve(n_ev);
+    unsafe { s.keys.set_len(n_ev) };
+    s.fill.clear();
+    s.fill.extend_from_slice(&s.ev_start[..persons as usize]);
     {
-        let mut fill: Vec<u32> = s.ev_start[..persons as usize].to_vec();
         let mut i = 0usize;
         for slice in events {
             for e in slice.iter() {
-                let id = s.ev_person[i] as usize;
-                s.evs[fill[id] as usize] = *e;
-                fill[id] += 1;
+                let id = unsafe { *s.ev_person.get_unchecked(i) } as usize;
+                let tag = if e.price != 0 {
+                    s.purchases.push((e.price, (e.pk >> 48) as u16));
+                    s.purchases.len() as u64
+                } else {
+                    0
+                };
+                unsafe {
+                    let at = s.fill.get_unchecked_mut(id);
+                    *s.keys.get_unchecked_mut(*at as usize) = (e.t as u64) << 32 | tag;
+                    *at += 1;
+                }
                 i += 1;
             }
         }
@@ -164,7 +203,7 @@ pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &m
 
     // Clicks of the people who have events.
     s.ck_start.clear();
-    s.ck_start.resize(persons as usize + 1, 0);
+    s.ck_start.resize(persons as usize, 0);
     s.ck_person.clear();
     let n_ck: usize = clicks.iter().map(|x| x.len()).sum();
     s.ck_person.reserve(n_ck);
@@ -173,41 +212,41 @@ pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &m
             let k = c.pk & PERSON_MASK;
             let mut h = take(fib(k), skip, tbits);
             let id = loop {
-                let cur = s.keys[h];
-                if cur == k {
-                    break s.ids[h];
-                }
-                if cur == 0 {
+                let slot = unsafe { table.get_unchecked(h) };
+                if slot.2 != epoch {
                     break u32::MAX;
+                }
+                if slot.0 == k {
+                    break slot.1;
                 }
                 h = (h + 1) & mask;
             };
             if id != u32::MAX {
-                s.ck_start[id as usize] += 1;
+                unsafe { *s.ck_start.get_unchecked_mut(id as usize) += 1 };
             }
             s.ck_person.push(id);
         }
     }
-    let mut acc = 0u32;
-    for c in s.ck_start.iter_mut() {
-        let n = *c;
-        *c = acc;
-        acc += n;
-    }
+    let kept = offsets(&mut s.ck_start) as usize;
     s.cks.clear();
-    s.cks.resize(acc as usize, Ck2::default());
+    s.cks.reserve(kept);
+    unsafe { s.cks.set_len(kept) };
+    s.fill.clear();
+    s.fill.extend_from_slice(&s.ck_start[..persons as usize]);
     {
-        let mut fill: Vec<u32> = s.ck_start[..persons as usize].to_vec();
         let mut i = 0usize;
         for slice in clicks {
             for c in slice.iter() {
-                let id = s.ck_person[i];
+                let id = unsafe { *s.ck_person.get_unchecked(i) };
                 i += 1;
                 if id == u32::MAX {
                     continue;
                 }
-                s.cks[fill[id as usize] as usize] = *c;
-                fill[id as usize] += 1;
+                unsafe {
+                    let at = s.fill.get_unchecked_mut(id as usize);
+                    *s.cks.get_unchecked_mut(*at as usize) = *c;
+                    *at += 1;
+                }
             }
         }
     }
@@ -215,12 +254,14 @@ pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &m
     for p in 0..persons as usize {
         let (a, b) = (s.ev_start[p] as usize, s.ev_start[p + 1] as usize);
         let (c, d) = (s.ck_start[p] as usize, s.ck_start[p + 1] as usize);
-        let evs = &mut s.evs[a..b];
-        evs.sort_unstable_by_key(|e| e.t);
-        let cks = &mut s.cks[c..d];
-        cks.sort_unstable_by_key(|c| c.t);
+        s.keys[a..b].sort_unstable();
+        if d - c > 1 {
+            s.cks[c..d].sort_unstable_by_key(|c| c.t);
+        }
         person(
-            &s.evs[a..b],
+            p as u32,
+            &s.keys[a..b],
+            &s.purchases,
             &s.cks[c..d],
             ctx,
             &mut s.in_window,
@@ -230,12 +271,18 @@ pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &m
             out,
         );
     }
+    // The rows of this partition carry local ids: give them person keys.
+    for r in &mut out.rows[first_row..] {
+        r.pk = s.person_keys[r.pk as usize];
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn person(
-    evs: &[Ev2],
+    id: u32,
+    keys: &[u64],
+    purchases: &[(u32, u16)],
     cks: &[Ck2],
     ctx: &Ctx,
     in_window: &mut [u32],
@@ -244,24 +291,29 @@ fn person(
     category_sums: &mut Vec<(u16, u64)>,
     out: &mut Out,
 ) {
-    let pk = evs[0].pk & PERSON_MASK;
+    // Rows carry the local id until the partition is done (see `process`).
+    let pk = id as u64;
     let days = ctx.days;
     let campaigns = ctx.campaigns;
     let mut row: Option<UdRow> = None;
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut i = 0usize;
-    while i < evs.len() {
-        let start = evs[i].t;
+    while i < keys.len() {
+        let start = (keys[i] >> 32) as u32;
         let mut last = start;
         let mut j = i;
         let mut revenue = 0u64;
         let mut purchased = false;
-        while j < evs.len() && evs[j].t - last <= GAP_MS {
-            let e = evs[j];
-            last = e.t;
-            if e.price != 0 {
+        while j < keys.len() {
+            let t = (keys[j] >> 32) as u32;
+            if t - last > GAP_MS {
+                break;
+            }
+            last = t;
+            let tag = keys[j] as u32;
+            if tag != 0 {
                 purchased = true;
-                revenue += e.price as u64;
+                revenue += purchases[tag as usize - 1].0 as u64;
             }
             j += 1;
         }
@@ -283,12 +335,13 @@ fn person(
         r.events += (j - i) as u32;
         r.revenue += revenue;
         if purchased {
-            for e in &evs[i..j] {
-                if e.price != 0 {
-                    let cat = (e.pk >> 48) as u16;
+            for &k in &keys[i..j] {
+                let tag = k as u32;
+                if tag != 0 {
+                    let (price, cat) = purchases[tag as usize - 1];
                     match category_sums.iter_mut().find(|(c, _)| *c == cat) {
-                        Some((_, sum)) => *sum += e.price as u64,
-                        None => category_sums.push((cat, e.price as u64)),
+                        Some((_, sum)) => *sum += price as u64,
+                        None => category_sums.push((cat, price as u64)),
                     }
                 }
             }

@@ -16,5 +16,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-debug = 1
+debug = false
 incremental = false
+
+# `cargo build --profile profiling` keeps symbols for perf/valgrind.
+[profile.profiling]
+inherits = "release"
+debug = 1

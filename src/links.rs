@@ -16,30 +16,13 @@ use crate::util::{fib, par_run, take, zeroed_vec, SharedMut};
 
 /// Person keys of linked IDs carry this bit; an unlinked ID's person key is its own user key.
 pub const LINKED: u64 = 1 << ids::KEY_BITS;
-/// Person keys use the low 48 bits.
-pub const PERSON_MASK: u64 = (1 << 48) - 1;
+/// Person keys use the low 44 bits; categories ride above them (bit 48+).
+pub const PERSON_MASK: u64 = (1 << 44) - 1;
 
-/// Compact user key: fast keys become one dense number (all IDs of 1 digit,
-/// then of 2 digits, ...), odd keys keep their interner index under bit 42.
-/// Below 2^43 either way.
+/// User keys are already compact (below 2^43, never 0): see ids.rs.
 #[inline(always)]
 fn compact(key: u64) -> u64 {
-    const OFFSET: [u64; 9] = [
-        0,
-        0,
-        36,
-        36 + 1_296,
-        36 + 1_296 + 46_656,
-        36 + 1_296 + 46_656 + 1_679_616,
-        36 + 1_296 + 46_656 + 1_679_616 + 60_466_176,
-        36 + 1_296 + 46_656 + 1_679_616 + 60_466_176 + 2_176_782_336,
-        36 + 1_296 + 46_656 + 1_679_616 + 60_466_176 + 2_176_782_336 + 78_364_164_096,
-    ];
-    if key & ids::ODD != 0 {
-        (1 << 42) | (key & !ids::ODD)
-    } else {
-        OFFSET[((key >> 42) & 15) as usize] + (key & ((1 << 42) - 1))
-    }
+    key
 }
 
 const KEY43: u64 = (1 << 43) - 1;
@@ -68,7 +51,7 @@ impl LinkTable {
     pub fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let h = self.home(compact(key) + 1);
+            let h = self.home(compact(key));
             let p = if self.wide.is_empty() {
                 self.narrow.as_ptr().add(h) as *const i8
             } else {
@@ -81,7 +64,7 @@ impl LinkTable {
     /// Person key of a user key.
     #[inline(always)]
     pub fn person_of(&self, key: u64) -> u64 {
-        let ck = compact(key) + 1;
+        let ck = compact(key);
         let mut i = self.home(ck);
         if self.wide.is_empty() {
             loop {
@@ -115,7 +98,7 @@ impl LinkTable {
     }
 
     fn insert(&mut self, key: u64, person: u64) {
-        let ck = compact(key) + 1;
+        let ck = compact(key);
         let mut i = self.home(ck);
         if self.wide.is_empty() {
             while self.narrow[i] != 0 {

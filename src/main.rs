@@ -20,6 +20,10 @@ mod util;
 static GLOBAL: util::HugeAlloc = util::HugeAlloc;
 
 fn main() {
+    if std::env::var_os("SESSIONS_MICRO_PARTS").is_some() {
+        micro::run_parts();
+        return;
+    }
     if let Some(path) = std::env::var_os("SESSIONS_MICRO") {
         micro::run(path.to_str().expect("utf-8 path"));
         return;
