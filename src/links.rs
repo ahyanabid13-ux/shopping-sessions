@@ -185,6 +185,9 @@ fn into_plain(v: Vec<AtomicU64>) -> Vec<u64> {
     unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut u64, v.len(), v.capacity()) }
 }
 
+/// Marks a numbered root's parent word (see `build`).
+const ROOT: u32 = 1 << 31;
+
 struct Builder {
     keys: Vec<AtomicU64>,
     /// 0: root; otherwise parent index + 1.
@@ -216,8 +219,9 @@ impl Builder {
     fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let p = self.keys.as_ptr().add(take(fib(key), 0, self.bits)) as *const i8;
-            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+            let home = take(fib(key), 0, self.bits);
+            std::arch::x86_64::_mm_prefetch(self.keys.as_ptr().add(home) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(self.parent.as_ptr().add(home) as *const i8, std::arch::x86_64::_MM_HINT_T0);
         }
     }
 
@@ -266,6 +270,18 @@ impl Builder {
         }
     }
 
+    /// Person number of slot `x`, once roots carry ROOT | person.
+    #[inline]
+    fn person_of(&self, mut x: u32) -> u32 {
+        loop {
+            let p = self.parent[x as usize].load(Ordering::Relaxed);
+            if p & ROOT != 0 {
+                return p & !ROOT;
+            }
+            x = p - 1;
+        }
+    }
+
     fn is_root(&self, s: usize) -> bool {
         self.keys[s].load(Ordering::Relaxed) != 0 && self.parent[s].load(Ordering::Relaxed) == 0
     }
@@ -276,8 +292,9 @@ pub fn build(pairs: &[Vec<(u64, u64)>], threads: usize, odd: &[Vec<u8>]) -> Link
     let t0 = std::time::Instant::now();
     let lap = |name: &str| if std::env::var_os("SESSIONS_VERBOSE").is_some() { eprintln!("    links.{name}: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3) };
     let total: usize = pairs.iter().map(|p| p.len()).sum();
-    // At most 2 IDs per pair; keep the load at or below one half.
-    let capacity = (total * 4).max(1024).next_power_of_two();
+    // At most 2 IDs per pair: keep the worst-case load at or below 0.7.
+    let capacity = (total * 20 / 7 + 1).max(1024).next_power_of_two();
+    assert!(capacity < ROOT as usize, "too many linked IDs");
     let mask = capacity - 1;
     let bits = capacity.trailing_zeros();
     let builder = unsafe { Builder { keys: zeroed_vec(capacity), parent: zeroed_vec(capacity), mask, bits } };
@@ -323,14 +340,14 @@ pub fn build(pairs: &[Vec<(u64, u64)>], threads: usize, odd: &[Vec<u8>]) -> Link
     let linked_ids: usize = counts.iter().map(|c| c.1).sum();
     assert!(persons < u32::MAX as usize, "too many linked persons");
 
-    // Number the roots densely, in slot order.
-    let person_of_root: Vec<AtomicU32> = unsafe { zeroed_vec(capacity) };
+    // Number the roots densely, in slot order. A root's parent word becomes
+    // ROOT | its person number (the union-find is finished).
     par_run(threads, |t| {
         let (lo, hi) = range(t);
         let mut next = first_person[t] as u32;
         for s in lo..hi {
             if builder.is_root(s) {
-                person_of_root[s].store(next, Ordering::Relaxed);
+                builder.parent[s].store(ROOT | next, Ordering::Relaxed);
                 next += 1;
             }
         }
@@ -354,8 +371,7 @@ pub fn build(pairs: &[Vec<(u64, u64)>], threads: usize, odd: &[Vec<u8>]) -> Link
             if key == 0 {
                 continue;
             }
-            let root = builder.find(s as u32) as usize;
-            let person = person_of_root[root].load(Ordering::Relaxed);
+            let person = builder.person_of(s as u32);
             table.insert(key, person as u64);
             if key & ids::ODD != 0 {
                 odd_members.push((person, key));
