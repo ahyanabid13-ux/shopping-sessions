@@ -1,0 +1,4 @@
+# Haswell-level instruction set (AVX2, BMI2): every n2 scorer (Cascade Lake or newer) has it.
+# A static binary runs in an empty image, so the container starts as fast as Docker allows.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
