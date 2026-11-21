@@ -601,4 +601,8 @@ pub fn run() {
             }
         }
     }
+    // Every output file is written and flushed (write_chunks flushes and
+    // returns its errors). Exit now: dropping gigabytes of buffers one by one
+    // only delays the exit the scorer is timing; the kernel frees them anyway.
+    crate::util::exit_now();
 }

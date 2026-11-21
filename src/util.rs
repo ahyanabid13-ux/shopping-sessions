@@ -50,6 +50,7 @@ mod ffi {
         pub fn mremap(old: *mut c_void, old_len: usize, new_len: usize, flags: i32, ...) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+        pub fn _exit(code: i32) -> !;
     }
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
@@ -70,6 +71,14 @@ mod ffi {
         #[cfg(target_os = "linux")]
         madvise(_p, _len, MADV_HUGEPAGE);
     }
+}
+
+/// Ends the process with status 0 at once, without running destructors.
+/// Call only when all output is written and flushed.
+pub fn exit_now() -> ! {
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    unsafe { ffi::_exit(0) }
 }
 
 /// The global allocator: allocations of 1 MiB or more get their own
