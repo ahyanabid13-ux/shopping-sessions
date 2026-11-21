@@ -201,9 +201,13 @@ impl Parser<'_> {
 }
 
 
-fn partition_bits(rows: usize, per_partition: usize) -> u32 {
-    let wanted = (rows / per_partition).max(1).next_power_of_two();
-    wanted.trailing_zeros().clamp(4, 14)
+/// Partition count (as bits) for `rows` records. Each thread stages one
+/// cache line per partition, and each partition's tables grow as rows /
+/// partitions: their sum is smallest near sqrt(rows / 3.2) partitions
+/// (measured best: 2048 at 20M events; 4096 at 60M).
+fn partition_bits(rows: usize) -> u32 {
+    let ideal = ((rows as f64 / 3.2).sqrt()).max(1.0);
+    (ideal.log2().round() as u32).clamp(4, 13)
 }
 
 /// Records whose person-table slot was prefetched, resolved in one go.
@@ -433,10 +437,14 @@ pub fn run() {
     // Rough line counts size the partitions: ~80 bytes per event line, ~45 per click line.
     let est_events = event_bytes / 80 + 1;
     let est_clicks = click_bytes / 45 + 1;
-    // Partitions small enough that the dedup and person tables stay in a
-    // 1 MiB L2 (the scorers' Cascade Lake cores).
-    let bits1 = partition_bits(est_events, 6_144);
-    let bits2 = partition_bits(est_events + est_clicks, 8_192);
+    // Partition counts balance the scatter's staging lines against the size
+    // of each partition's dedup and person tables (see `partition_bits`).
+    let bits_override = std::env::var("SESSIONS_BITS").ok().and_then(|v| v.parse::<u32>().ok());
+    let bits1 = bits_override.unwrap_or_else(|| partition_bits(est_events));
+    let bits2 = bits_override.unwrap_or_else(|| partition_bits(est_events + est_clicks));
+    if verbose {
+        eprintln!("    partitions: events {} / persons {}", 1 << bits1, 1 << bits2);
+    }
     let (p1, p2) = (1usize << bits1, 1usize << bits2);
     let work: Vec<&Segment> = event_segments.iter().chain(&click_segments).collect();
     let next = AtomicUsize::new(0);
