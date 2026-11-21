@@ -46,6 +46,7 @@ mod ffi {
     extern "C" {
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        #[cfg(target_os = "linux")]
         pub fn mremap(old: *mut c_void, old_len: usize, new_len: usize, flags: i32, ...) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
@@ -53,9 +54,22 @@ mod ffi {
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_PRIVATE: i32 = 2;
+    #[cfg(target_os = "linux")]
     pub const MAP_ANONYMOUS: i32 = 0x20;
+    // macOS is only a local test platform: no huge pages, no mremap.
+    #[cfg(target_os = "macos")]
+    pub const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(target_os = "linux")]
     pub const MREMAP_MAYMOVE: i32 = 1;
-    pub const MADV_HUGEPAGE: i32 = 14;
+    #[cfg(target_os = "linux")]
+    const MADV_HUGEPAGE: i32 = 14;
+
+    /// Asks for transparent huge pages (Linux only; a no-op elsewhere).
+    #[inline]
+    pub unsafe fn advise_huge(_p: *mut c_void, _len: usize) {
+        #[cfg(target_os = "linux")]
+        madvise(_p, _len, MADV_HUGEPAGE);
+    }
 }
 
 /// The global allocator: allocations of 1 MiB or more get their own
@@ -95,7 +109,7 @@ unsafe fn map_huge(size: usize) -> *mut u8 {
     if tail > 0 {
         ffi::munmap((aligned + len) as *mut _, tail);
     }
-    ffi::madvise(aligned as *mut _, len, ffi::MADV_HUGEPAGE);
+    ffi::advise_huge(aligned as *mut _, len);
     aligned as *mut u8
 }
 
@@ -135,12 +149,15 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
             if old_len == new_len {
                 return ptr;
             }
-            let p = ffi::mremap(ptr as *mut _, old_len, new_len, ffi::MREMAP_MAYMOVE);
-            if p as isize == -1 {
-                return std::ptr::null_mut();
+            #[cfg(target_os = "linux")]
+            {
+                let p = ffi::mremap(ptr as *mut _, old_len, new_len, ffi::MREMAP_MAYMOVE);
+                if p as isize == -1 {
+                    return std::ptr::null_mut();
+                }
+                ffi::advise_huge(p, new_len);
+                return p as *mut u8;
             }
-            ffi::madvise(p, new_len, ffi::MADV_HUGEPAGE);
-            return p as *mut u8;
         }
         if !old_large && !new_large {
             return std::alloc::System.realloc(ptr, layout, new_size);
@@ -205,7 +222,7 @@ pub fn alloc_zeroed_huge<T: Copy>(count: usize) -> &'static mut [T] {
         panic!("mmap of {bytes} bytes failed: {}", io::Error::last_os_error());
     }
     unsafe {
-        ffi::madvise(ptr, bytes, ffi::MADV_HUGEPAGE);
+        ffi::advise_huge(ptr, bytes);
         std::slice::from_raw_parts_mut(ptr as *mut T, count)
     }
 }
