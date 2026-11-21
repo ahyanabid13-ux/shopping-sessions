@@ -39,7 +39,7 @@ pub fn run(path: &str) {
         let mut pos = start;
         let mut acc = 0u64;
         while pos < fast_end {
-            match fast::scan_window::<7>(&data, pos, &mut fs, &mut fe) {
+            match fast::scan_window::<7, true>(&data, pos, &mut fs, &mut fe) {
                 fast::Window::Line { end, ok } => {
                     acc += ok as u64 + fe[3] as u64;
                     pos = end + 1;
@@ -56,7 +56,7 @@ pub fn run(path: &str) {
         let mut pos = start;
         let mut acc = 0u64;
         while pos < fast_end {
-            match fast::scan_window::<7>(&data, pos, &mut fs, &mut fe) {
+            match fast::scan_window::<7, true>(&data, pos, &mut fs, &mut fe) {
                 fast::Window::Line { end, ok } => {
                     if ok {
                         acc = acc.wrapping_add(fast::timestamp(&data, fs[2], fe[2]).unwrap_or(0) as u64);
@@ -77,7 +77,7 @@ pub fn run(path: &str) {
             let mut pos = start;
             let mut acc = 0u64;
             while pos < fast_end {
-                match fast::scan_window::<7>(&data, pos, &mut fs, &mut fe) {
+                match fast::scan_window::<7, true>(&data, pos, &mut fs, &mut fe) {
                     fast::Window::Line { end, ok } => {
                         if ok {
                             acc = acc.wrapping_add(fast::timestamp(&data, fs[field], fe[field]).unwrap_or(0) as u64);
@@ -99,7 +99,7 @@ pub fn run(path: &str) {
             let mut pos = start;
             let mut acc = 0u64;
             while pos < fast_end {
-                match fast::scan_window::<7>(&data, pos, &mut fs, &mut fe) {
+                match fast::scan_window::<7, true>(&data, pos, &mut fs, &mut fe) {
                     fast::Window::Line { end, ok } => {
                         if ok {
                             acc = acc.wrapping_add(fast::timestamp_m(&data, fs[field], fe[field], &months).unwrap_or(0) as u64);
@@ -119,7 +119,7 @@ pub fn run(path: &str) {
         let mut pos = start;
         let mut acc = 0u64;
         while pos < fast_end {
-            match fast::scan_window::<7>(&data, pos, &mut fs, &mut fe) {
+            match fast::scan_window::<7, true>(&data, pos, &mut fs, &mut fe) {
                 fast::Window::Line { end, ok } => {
                     if ok {
                         acc = acc.wrapping_add(fast::id_key(&data, fs[0], fe[0], b'e'));

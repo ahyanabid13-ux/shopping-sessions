@@ -8,7 +8,7 @@
 //! 5. write:   Parquet
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::fast;
@@ -214,7 +214,19 @@ const PREFETCH_AHEAD: usize = 2048;
 /// Lines of one segment, through the window fast path when possible.
 /// Calls `f(fs, fe)` for every well-formed line with N fields.
 #[inline(always)]
-fn lines<const N: usize>(d: &[u8], seg: &Segment, mut f: impl FnMut(&[usize; N], &[usize; N])) {
+fn lines<const N: usize>(d: &[u8], seg: &Segment, f: impl FnMut(&[usize; N], &[usize; N])) {
+    if PDEP_FAST.load(Ordering::Relaxed) {
+        lines_with::<N, true>(d, seg, f)
+    } else {
+        lines_with::<N, false>(d, seg, f)
+    }
+}
+
+/// Whether the window splitter may use pdep/pext (see `fast::pdep_is_fast`).
+static PDEP_FAST: AtomicBool = AtomicBool::new(true);
+
+#[inline(always)]
+fn lines_with<const N: usize, const PDEP: bool>(d: &[u8], seg: &Segment, mut f: impl FnMut(&[usize; N], &[usize; N])) {
     let len = d.len();
     let mut pos = first_line(d, seg.start);
     let fast_end = seg.end.min(len.saturating_sub(128));
@@ -228,7 +240,7 @@ fn lines<const N: usize>(d: &[u8], seg: &Segment, mut f: impl FnMut(&[usize; N],
             std::arch::x86_64::_mm_prefetch(ahead, std::arch::x86_64::_MM_HINT_T0);
             std::arch::x86_64::_mm_prefetch(ahead.wrapping_add(64), std::arch::x86_64::_MM_HINT_T0);
         }
-        let (end, ok) = match if pos < fast_end { fast::scan_window::<N>(d, pos, &mut fs, &mut fe) } else { fast::Window::Long } {
+        let (end, ok) = match if pos < fast_end { fast::scan_window::<N, PDEP>(d, pos, &mut fs, &mut fe) } else { fast::Window::Long } {
             fast::Window::Line { end, ok } => (end, ok),
             fast::Window::Long => {
                 let (end, n, quotes) = fast::scan::<N>(d, pos, &mut fs, &mut fe);
@@ -318,6 +330,8 @@ pub fn run() {
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads = thread_count();
+    let pdep = std::env::var("SESSIONS_PDEP").map_or_else(|_| fast::pdep_is_fast(), |v| v != "0");
+    PDEP_FAST.store(pdep, Ordering::Relaxed);
 
     let window = lookup::read_manifest(&data.join("manifest.json"));
     let products = Products::read(&data.join("products.csv"));
@@ -342,6 +356,9 @@ pub fn run() {
     let click_segments = segments(&maps, n_ev, n_ck);
     let link_segments = segments(&maps, n_ev + n_ck, n_ln);
     lap("setup");
+    if verbose {
+        eprintln!("    {threads} threads, window splitter: {}", if pdep { "pdep" } else { "tzcnt" });
+    }
 
     let interner = Interner::new();
     let parser = Parser {

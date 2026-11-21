@@ -93,6 +93,62 @@ pub enum Window {
     Long,
 }
 
+/// Splits the line at `start` when it fits in the 128-byte window
+/// `data[start..start + 128]`, which the caller guarantees is readable.
+///
+/// Newline, comma and quote masks cover the window as one 128-bit mask
+/// each. The commas are visited in order with tzcnt / clear-lowest-bit
+/// (fast on every x86-64 CPU, unlike pdep/pext on AMD Zen 1 and 2). A field
+/// is wrapped when its first and last bytes are quotes and it is at least
+/// two bytes long; the line is well formed when every quote is one end of a
+/// wrapping pair, i.e. quotes == 2 x wrapped fields.
+///
+/// A line whose first field is empty reports `ok == false`: such a line is
+/// dropped by every caller (empty event_id, click_id or link side).
+#[inline(always)]
+fn scan_window_tz<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+    debug_assert!(start + 128 <= data.len());
+    unsafe {
+        let p = data.as_ptr().add(start);
+        let (nl0, cm0, q0) = masks64(p);
+        let (nl1, cm1, q1) = masks64(p.add(64));
+        if nl0 | nl1 == 0 {
+            return Window::Long;
+        }
+        let e = if nl0 != 0 { nl0.trailing_zeros() } else { 64 + nl1.trailing_zeros() };
+        let end = start + e as usize;
+        // Keep bits below the newline (bzhi leaves everything for index >= 64).
+        let k0 = _bzhi_u64(u64::MAX, e);
+        let k1 = _bzhi_u64(u64::MAX, e.saturating_sub(64));
+        let (c0, c1, q0, q1) = (cm0 & k0, cm1 & k1, q0 & k0, q1 & k1);
+        if c0.count_ones() + c1.count_ones() != (N - 1) as u32 || c0 & 1 != 0 || e == 0 {
+            return Window::Line { end, ok: false };
+        }
+        let mut rest = c0 as u128 | (c1 as u128) << 64;
+        let q = q0 as u128 | (q1 as u128) << 64;
+        let mut cur = 0u32;
+        let mut wrapped = 0u32;
+        for i in 0..N {
+            let at = if i + 1 < N {
+                let b = rest.trailing_zeros();
+                rest &= rest - 1;
+                b
+            } else {
+                e
+            };
+            // Field bytes are [cur, at); at >= cur + 1 > 0 except for an
+            // empty first field, rejected above.
+            let w = ((q >> cur) & (q >> (at - 1)) & 1) as u32 & (at >= cur + 2) as u32;
+            fs[i] = start + (cur + w) as usize;
+            fe[i] = start + (at - w) as usize;
+            wrapped += w;
+            cur = at + 1;
+        }
+        let ok = q0.count_ones() + q1.count_ones() == 2 * wrapped;
+        Window::Line { end, ok }
+    }
+}
+
 /// Bits of `x` selected by the 128-bit mask (lo, hi), packed in order.
 #[inline(always)]
 fn pext2(x0: u64, x1: u64, m0: u64, m1: u64) -> u64 {
@@ -112,7 +168,7 @@ fn pext2(x0: u64, x1: u64, m0: u64, m1: u64) -> u64 {
 /// A line whose first field is empty reports `ok == false`: such a line is
 /// dropped by every caller (empty event_id, click_id or link side).
 #[inline(always)]
-pub fn scan_window<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+fn scan_window_pdep<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
     debug_assert!(start + 128 <= data.len());
     unsafe {
         let p = data.as_ptr().add(start);
@@ -156,6 +212,42 @@ pub fn scan_window<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N
         fs[N - 1] = cur + w;
         fe[N - 1] = end - w;
         Window::Line { end, ok }
+    }
+}
+
+/// True when pdep/pext are fast here. They are microcoded (hundreds of
+/// cycles) on AMD family 17h (Zen, Zen+, Zen 2) and on Hygon (family 18h).
+pub fn pdep_is_fast() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let leaf0 = __cpuid(0);
+        let mut vendor = [0u8; 12];
+        vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+        vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+        if &vendor == b"HygonGenuine" {
+            return false;
+        }
+        if &vendor == b"AuthenticAMD" {
+            let eax = __cpuid(1).eax;
+            let base = (eax >> 8) & 0xF;
+            let family = if base == 0xF { base + ((eax >> 20) & 0xFF) } else { base };
+            return family != 0x17;
+        }
+    }
+    true
+}
+
+/// Splits the line at `start` when it fits in the 128-byte window
+/// `data[start..start + 128]` (readable, guaranteed by the caller), with
+/// the pdep/pext form when `PDEP` and the tzcnt form otherwise. Both give
+/// the same result for every input.
+#[inline(always)]
+pub fn scan_window<const N: usize, const PDEP: bool>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+    if PDEP {
+        scan_window_pdep::<N>(data, start, fs, fe)
+    } else {
+        scan_window_tz::<N>(data, start, fs, fe)
     }
 }
 
@@ -597,28 +689,30 @@ mod tests {
             data.extend_from_slice(&line);
             data.push(b'\n');
             data.extend_from_slice(&[b'z'; 200]);
-            let mut fs = [0usize; 7];
-            let mut fe = [0usize; 7];
-            match scan_window::<7>(&data, 7, &mut fs, &mut fe) {
-                Window::Long => assert!(line.len() >= 128),
-                Window::Line { end, ok } => {
-                    assert!(line.len() < 128);
-                    assert_eq!(end, 7 + line.len());
-                    let got = ok
-                        .then(|| (0..7).map(|i| data[fs[i]..fe[i]].to_vec()).collect::<Vec<_>>())
-                        .filter(|f| !f[0].is_empty());
-                    // Lines whose first field is empty are dropped by every caller.
-                    let want = scan_ref::<7>(&line).filter(|f| !f[0].is_empty());
-                    assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&line));
-                }
-            }
-            let mut fs = [0usize; 2];
-            let mut fe = [0usize; 2];
-            if let Window::Line { ok, .. } = scan_window::<2>(&data, 7, &mut fs, &mut fe) {
+            check_window::<7, true>(&data, &line);
+            check_window::<7, false>(&data, &line);
+            check_window::<4, true>(&data, &line);
+            check_window::<4, false>(&data, &line);
+            check_window::<2, true>(&data, &line);
+            check_window::<2, false>(&data, &line);
+        }
+    }
+
+    /// `scan_window` of the line at offset 7 of `data` against the reference.
+    fn check_window<const N: usize, const PDEP: bool>(data: &[u8], line: &[u8]) {
+        let mut fs = [0usize; N];
+        let mut fe = [0usize; N];
+        match scan_window::<N, PDEP>(data, 7, &mut fs, &mut fe) {
+            Window::Long => assert!(line.len() >= 128),
+            Window::Line { end, ok } => {
+                assert!(line.len() < 128);
+                assert_eq!(end, 7 + line.len());
                 let got = ok
-                    .then(|| (0..2).map(|i| data[fs[i]..fe[i]].to_vec()).collect::<Vec<_>>())
+                    .then(|| (0..N).map(|i| data[fs[i]..fe[i]].to_vec()).collect::<Vec<_>>())
                     .filter(|f| !f[0].is_empty());
-                assert_eq!(got, scan_ref::<2>(&line).filter(|f| !f[0].is_empty()), "{:?}", String::from_utf8_lossy(&line));
+                // Lines whose first field is empty are dropped by every caller.
+                let want = scan_ref::<N>(line).filter(|f| !f[0].is_empty());
+                assert_eq!(got, want, "N={N} pdep={PDEP} {:?}", String::from_utf8_lossy(line));
             }
         }
     }
