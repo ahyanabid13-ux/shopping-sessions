@@ -99,13 +99,16 @@ impl LinkTable {
                     let b = _mm256_load_si256(line.add(1));
                     let hit = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(a, km), want)))
                         | _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(b, km), want))) << 4;
-                    if hit != 0 {
-                        return LINKED | *base.add(i + hit.trailing_zeros() as usize) >> 43;
-                    }
                     let empty = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, zero)))
                         | _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, zero)));
-                    if empty != 0 {
-                        return key;
+                    // Hit and miss are close to 50/50, so the outcome is a
+                    // select, not a branch; only "keep probing" branches.
+                    // With no hit, `& 7` reads slot 0 of this same bucket,
+                    // whose value the mask then discards.
+                    if (hit | empty) != 0 {
+                        let w = *base.add(i + (hit.trailing_zeros() & 7) as usize);
+                        let m = 0u64.wrapping_sub((hit != 0) as u64);
+                        return (m & (LINKED | w >> 43)) | (!m & key);
                     }
                     i += LINE_WORDS;
                     if i == total {

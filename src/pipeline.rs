@@ -215,14 +215,31 @@ const LOOKAHEAD: usize = 16;
 /// How far ahead of the line being split its bytes are prefetched.
 const PREFETCH_AHEAD: usize = 2048;
 
+/// Receives every well-formed line of a segment. A trait method marked
+/// `inline(always)` (unlike a closure, which stable Rust cannot mark) keeps
+/// the per-line work inside the line loop instead of behind a call.
+trait LineSink<const N: usize> {
+    fn line(&mut self, fs: &[usize; N], fe: &[usize; N]);
+}
+
+/// Cold paths (links, bench modes) still pass closures.
+struct FnSink<F>(F);
+
+impl<const N: usize, F: FnMut(&[usize; N], &[usize; N])> LineSink<N> for FnSink<F> {
+    #[inline(always)]
+    fn line(&mut self, fs: &[usize; N], fe: &[usize; N]) {
+        (self.0)(fs, fe)
+    }
+}
+
 /// Lines of one segment, through the window fast path when possible.
-/// Calls `f(fs, fe)` for every well-formed line with N fields.
+/// Calls `sink.line(fs, fe)` for every well-formed line with N fields.
 #[inline(always)]
-fn lines<const N: usize>(d: &[u8], seg: &Segment, f: impl FnMut(&[usize; N], &[usize; N])) {
+fn lines<const N: usize, S: LineSink<N>>(d: &[u8], seg: &Segment, sink: &mut S) {
     if PDEP_FAST.load(Ordering::Relaxed) {
-        lines_with::<N, true>(d, seg, f)
+        lines_with::<N, true, S>(d, seg, sink)
     } else {
-        lines_with::<N, false>(d, seg, f)
+        lines_with::<N, false, S>(d, seg, sink)
     }
 }
 
@@ -230,7 +247,7 @@ fn lines<const N: usize>(d: &[u8], seg: &Segment, f: impl FnMut(&[usize; N], &[u
 static PDEP_FAST: AtomicBool = AtomicBool::new(true);
 
 #[inline(always)]
-fn lines_with<const N: usize, const PDEP: bool>(d: &[u8], seg: &Segment, mut f: impl FnMut(&[usize; N], &[usize; N])) {
+fn lines_with<const N: usize, const PDEP: bool, S: LineSink<N>>(d: &[u8], seg: &Segment, sink: &mut S) {
     let len = d.len();
     let mut pos = first_line(d, seg.start);
     let fast_end = seg.end.min(len.saturating_sub(128));
@@ -252,9 +269,82 @@ fn lines_with<const N: usize, const PDEP: bool>(d: &[u8], seg: &Segment, mut f: 
             }
         };
         if ok {
-            f(&fs, &fe);
+            sink.line(&fs, &fe);
         }
         pos = end + 1;
+    }
+}
+
+/// Per-segment state of the events parse: valid copies wait LOOKAHEAD
+/// records in a ring after their person-table line is prefetched.
+struct EventSink<'p, 'a> {
+    parser: &'p Parser<'a>,
+    d: &'p [u8],
+    links: &'p LinkTable,
+    bits1: u32,
+    out: &'p mut Scatter<Ev1>,
+    ring: [Ev1; LOOKAHEAD],
+    count: usize,
+}
+
+impl EventSink<'_, '_> {
+    #[inline(always)]
+    fn resolve(links: &LinkTable, bits1: u32, rec: Ev1, out: &mut Scatter<Ev1>) {
+        let mut r = rec;
+        r.pk = links.person_of(r.pk & USER_MASK) | (r.pk & !PERSON_MASK);
+        out.push(take(fib(r.key), 0, bits1), r);
+    }
+}
+
+impl LineSink<7> for EventSink<'_, '_> {
+    #[inline(always)]
+    fn line(&mut self, fs: &[usize; 7], fe: &[usize; 7]) {
+        let Some(rec) = self.parser.event(self.d, fs, fe) else { return };
+        if rec.tp & VALID == 0 {
+            self.out.push(take(fib(rec.key), 0, self.bits1), rec);
+            return;
+        }
+        self.links.prefetch(rec.pk & USER_MASK);
+        let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
+        if self.count >= LOOKAHEAD {
+            Self::resolve(self.links, self.bits1, *slot, self.out);
+        }
+        *slot = rec;
+        self.count += 1;
+    }
+}
+
+/// Per-segment state of the clicks parse, with the same lookahead ring.
+struct ClickSink<'p, 'a> {
+    parser: &'p Parser<'a>,
+    d: &'p [u8],
+    links: &'p LinkTable,
+    bits2: u32,
+    out: &'p mut Scatter<Ck2>,
+    ring: [Ck2; LOOKAHEAD],
+    count: usize,
+}
+
+impl ClickSink<'_, '_> {
+    #[inline(always)]
+    fn resolve(links: &LinkTable, bits2: u32, c: Ck2, out: &mut Scatter<Ck2>) {
+        let mut c = c;
+        c.pk = links.person_of(c.pk);
+        out.push(take(fib(c.pk), 0, bits2), c);
+    }
+}
+
+impl LineSink<4> for ClickSink<'_, '_> {
+    #[inline(always)]
+    fn line(&mut self, fs: &[usize; 4], fe: &[usize; 4]) {
+        let Some(c) = self.parser.click(self.d, fs, fe) else { return };
+        self.links.prefetch(c.pk);
+        let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
+        if self.count >= LOOKAHEAD {
+            Self::resolve(self.links, self.bits2, *slot, self.out);
+        }
+        *slot = c;
+        self.count += 1;
     }
 }
 
@@ -262,57 +352,22 @@ impl Parser<'_> {
     /// Parses one events segment into `out` (partitioned by event key).
     #[inline(never)]
     fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
-        // Each valid copy's person-table line is prefetched when it is parsed
-        // and resolved LOOKAHEAD copies later, so every lookup gets the same
-        // head start.
-        let mut ring = [Ev1::default(); LOOKAHEAD];
-        let mut count = 0usize;
-        let resolve = |rec: Ev1, out: &mut Scatter<Ev1>| {
-            let mut r = rec;
-            r.pk = links.person_of(r.pk & USER_MASK) | (r.pk & !PERSON_MASK);
-            out.push(take(fib(r.key), 0, bits1), r);
-        };
-        lines::<7>(d, seg, |fs, fe| {
-            let Some(rec) = self.event(d, fs, fe) else { return };
-            if rec.tp & VALID == 0 {
-                out.push(take(fib(rec.key), 0, bits1), rec);
-                return;
-            }
-            links.prefetch(rec.pk & USER_MASK);
-            let slot = unsafe { ring.get_unchecked_mut(count % LOOKAHEAD) };
-            if count >= LOOKAHEAD {
-                resolve(*slot, out);
-            }
-            *slot = rec;
-            count += 1;
-        });
+        let mut sink = EventSink { parser: self, d, links, bits1, out, ring: [Ev1::default(); LOOKAHEAD], count: 0 };
+        lines::<7, _>(d, seg, &mut sink);
+        let EventSink { ring, count, out, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
-            resolve(ring[i % LOOKAHEAD], out);
+            EventSink::resolve(links, bits1, ring[i % LOOKAHEAD], out);
         }
     }
 
     /// Parses one clicks segment into `out` (partitioned by person).
     #[inline(never)]
     fn clicks_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
-        let mut ring = [Ck2::default(); LOOKAHEAD];
-        let mut count = 0usize;
-        let resolve = |c: Ck2, out: &mut Scatter<Ck2>| {
-            let mut c = c;
-            c.pk = links.person_of(c.pk);
-            out.push(take(fib(c.pk), 0, bits2), c);
-        };
-        lines::<4>(d, seg, |fs, fe| {
-            let Some(c) = self.click(d, fs, fe) else { return };
-            links.prefetch(c.pk);
-            let slot = unsafe { ring.get_unchecked_mut(count % LOOKAHEAD) };
-            if count >= LOOKAHEAD {
-                resolve(*slot, out);
-            }
-            *slot = c;
-            count += 1;
-        });
+        let mut sink = ClickSink { parser: self, d, links, bits2, out, ring: [Ck2::default(); LOOKAHEAD], count: 0 };
+        lines::<4, _>(d, seg, &mut sink);
+        let ClickSink { ring, count, out, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
-            resolve(ring[i % LOOKAHEAD], out);
+            ClickSink::resolve(links, bits2, ring[i % LOOKAHEAD], out);
         }
     }
 }
@@ -391,11 +446,11 @@ pub fn run() {
             let at = next.fetch_add(1, Ordering::Relaxed);
             let Some(seg) = link_segments.get(at) else { break };
             let d = maps[seg.file].bytes();
-            lines::<2>(d, seg, |fs, fe| {
+            lines::<2, _>(d, seg, &mut FnSink(|fs: &[usize; 2], fe: &[usize; 2]| {
                 if fs[0] != fe[0] && fs[1] != fe[1] {
                     pairs.push((parser.key(d, fs[0], fe[0], b'u'), parser.key(d, fs[1], fe[1], b'u')));
                 }
-            });
+            }));
         }
         pairs
     });
@@ -418,7 +473,7 @@ pub fn run() {
                 let at = next.fetch_add(1, Ordering::Relaxed);
                 let Some(seg) = work.get(at) else { break };
                 let d = maps[seg.file].bytes();
-                lines::<7>(d, seg, |fs, fe| {
+                lines::<7, _>(d, seg, &mut FnSink(|fs: &[usize; 7], fe: &[usize; 7]| {
                     count += 1;
                     if mode >= 2 {
                         if let Some(rec) = parser.event(d, fs, fe) {
@@ -427,7 +482,7 @@ pub fn run() {
                     } else {
                         acc = acc.wrapping_add((fe[6] - fs[0]) as u64);
                     }
-                });
+                }));
             }
             (count, acc)
         });
