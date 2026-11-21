@@ -70,34 +70,54 @@ pub struct Products {
 
 impl Products {
     pub fn read(path: &Path) -> Products {
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for line in lines_of(path) {
-            let Some([id, category]) = csv::split::<2>(&line) else { continue };
+        let data = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // Category names get provisional ids in order of appearance; ids
+        // become byte-wise ranks once all names are known. A repeated
+        // product ID keeps its last category.
+        let mut provisional: HashMap<&[u8], u16> = HashMap::new();
+        let mut names: Vec<&[u8]> = Vec::new();
+        let mut direct: Vec<u16> = Vec::new();
+        let mut other: HashMap<Vec<u8>, u16> = HashMap::new();
+        const NONE: u16 = u16::MAX;
+        csv::for_each_line(&data, 0, data.len(), |line| {
+            let Some([id, category]) = csv::split::<2>(line) else { return };
             if id.is_empty() {
-                continue;
+                return;
             }
-            pairs.push((id.to_vec(), category.to_vec()));
-        }
-        let mut names: Vec<Vec<u8>> = pairs.iter().map(|(_, c)| c.clone()).collect();
-        names.push(b"unknown".to_vec());
-        names.sort();
-        names.dedup();
-        assert!(names.len() < u16::MAX as usize, "more than 65534 categories");
-        let index: HashMap<&[u8], u16> = names.iter().enumerate().map(|(i, n)| (n.as_slice(), i as u16)).collect();
-        let unknown = index[&b"unknown"[..]];
-        let max_direct = pairs.iter().filter_map(|(id, _)| canonical_number(id, b"p")).max().unwrap_or(0);
-        let mut direct = vec![unknown; if max_direct > 0 { max_direct + 1 } else { 0 }];
-        let mut other = HashMap::new();
-        for (id, category) in &pairs {
-            let c = index[category.as_slice()];
+            let c = *provisional.entry(category).or_insert_with(|| {
+                names.push(category);
+                (names.len() - 1) as u16
+            });
+            assert!(names.len() < u16::MAX as usize - 1, "more than 65533 categories");
             match canonical_number(id, b"p") {
-                Some(v) => direct[v] = c,
+                Some(v) => {
+                    if v >= direct.len() {
+                        direct.resize(v + 1, NONE);
+                    }
+                    direct[v] = c;
+                }
                 None => {
-                    other.insert(id.clone(), c);
+                    other.insert(id.to_vec(), c);
                 }
             }
+        });
+        // Rank every name, "unknown" included, in byte-wise order.
+        let mut sorted: Vec<&[u8]> = names.clone();
+        if !provisional.contains_key(&b"unknown"[..]) {
+            sorted.push(b"unknown");
         }
-        Products { categories: names, unknown, direct, other }
+        sorted.sort_unstable();
+        let rank = |name: &[u8]| sorted.binary_search(&name).expect("category is ranked") as u16;
+        let remap: Vec<u16> = names.iter().map(|n| rank(n)).collect();
+        let unknown = rank(b"unknown");
+        for d in direct.iter_mut() {
+            *d = if *d == NONE { unknown } else { remap[*d as usize] };
+        }
+        for c in other.values_mut() {
+            *c = remap[*c as usize];
+        }
+        let categories = sorted.iter().map(|n| n.to_vec()).collect();
+        Products { categories, unknown, direct, other }
     }
 
     /// Category id of a (non-empty) product ID.

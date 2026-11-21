@@ -62,7 +62,7 @@ pub fn unquote(f: &[u8]) -> Option<&[u8]> {
 /// owns: the lines that begin inside it. The first line of the file (offset
 /// 0) is the header and is skipped. A final line without `\n` still counts.
 #[inline]
-pub fn for_each_line(data: &[u8], start: usize, end: usize, mut on_line: impl FnMut(&[u8])) {
+pub fn for_each_line<'a>(data: &'a [u8], start: usize, end: usize, mut on_line: impl FnMut(&'a [u8])) {
     let len = data.len();
     let mut pos = if start == 0 {
         match memchr_nl(data, 0) {
