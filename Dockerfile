@@ -1,9 +1,9 @@
 # Shopping Sessions: a single static Rust binary in an empty image.
 #
-# Build stage: Rust toolchain pinned by digest-stable tag; no crates are
+# Build stage: the Rust toolchain pinned by digest; no crates are
 # downloaded (the engine has no dependencies), so the build needs no network
 # beyond the base image.
-FROM rust:1.89-slim-bookworm AS build
+FROM rust:1.89-slim-bookworm@sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
