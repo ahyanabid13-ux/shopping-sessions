@@ -117,6 +117,37 @@ fn offsets(counts: &mut Vec<u32>) -> u32 {
     acc
 }
 
+/// Starts a new epoch on a person table of at least `cap` slots: every
+/// slot stamped with an older epoch counts as empty.
+fn begin_epoch(s: &mut Scratch, cap: usize) {
+    if s.table.len() < cap || s.epoch == u32::MAX {
+        s.table.clear();
+        s.table.resize(cap.max(s.table.len()), (0, 0, 0));
+        s.epoch = 0;
+    }
+    s.epoch += 1;
+}
+
+/// The local id of person key `k` in the first `cap` slots of the table,
+/// inserting it as `next` when absent; the bool says whether it was new.
+#[inline(always)]
+fn find_or_insert(s: &mut Scratch, cap: usize, skip: u32, k: u64, next: u32) -> (u32, bool) {
+    let mask = cap - 1;
+    let epoch = s.epoch;
+    let mut h = take(fib(k), skip, cap.trailing_zeros());
+    loop {
+        let slot = unsafe { s.table.get_unchecked_mut(h) };
+        if slot.2 != epoch {
+            *slot = (k, next, epoch);
+            return (next, true);
+        }
+        if slot.0 == k {
+            return (slot.1, false);
+        }
+        h = (h + 1) & mask;
+    }
+}
+
 /// Processes one partition: `events` and `clicks` are the slices every
 /// thread scattered into it. `skip` is the number of top hash bits that
 /// chose this partition.
@@ -130,18 +161,10 @@ pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &m
         s.position = vec![0; ctx.campaigns];
     }
 
-    // Local dense person ids, from an epoch-stamped table at load <= 2/3.
-    let cap = (n_ev + n_ev / 2).max(16).next_power_of_two();
-    if s.table.len() < cap {
-        s.table.clear();
-        s.table.resize(cap, (0, 0, 0));
-        s.epoch = 0;
-    }
-    s.epoch += 1;
-    let epoch = s.epoch;
-    let mask = cap - 1;
-    let tbits = cap.trailing_zeros();
-    let table = &mut s.table[..cap];
+    // Local dense person ids, from an epoch-stamped table sized for the
+    // persons (not the events) and doubled whenever its load passes 2/3.
+    let mut cap = (n_ev / 8).max(64).next_power_of_two();
+    begin_epoch(s, cap);
     s.ev_person.clear();
     s.ev_person.reserve(n_ev);
     s.ev_start.clear();
@@ -151,25 +174,28 @@ pub fn process(events: &[&[Ev2]], clicks: &[&[Ck2]], skip: u32, ctx: &Ctx, s: &m
     for slice in events {
         for e in slice.iter() {
             let k = e.pk & PERSON_MASK;
-            let mut h = take(fib(k), skip, tbits);
-            let id = loop {
-                let slot = unsafe { table.get_unchecked_mut(h) };
-                if slot.2 != epoch {
-                    *slot = (k, persons, epoch);
-                    persons += 1;
-                    s.ev_start.push(0);
-                    s.person_keys.push(k);
-                    break persons - 1;
+            let (id, new) = find_or_insert(s, cap, skip, k, persons);
+            if new {
+                persons += 1;
+                s.ev_start.push(0);
+                s.person_keys.push(k);
+                if persons as usize * 3 > cap * 2 {
+                    cap *= 2;
+                    begin_epoch(s, cap);
+                    for i in 0..s.person_keys.len() {
+                        let key = s.person_keys[i];
+                        find_or_insert(s, cap, skip, key, i as u32);
+                    }
                 }
-                if slot.0 == k {
-                    break slot.1;
-                }
-                h = (h + 1) & mask;
-            };
+            }
             unsafe { *s.ev_start.get_unchecked_mut(id as usize) += 1 };
             s.ev_person.push(id);
         }
     }
+    let tbits = cap.trailing_zeros();
+    let mask = cap - 1;
+    let epoch = s.epoch;
+    let table = &s.table[..cap];
     offsets(&mut s.ev_start);
 
     // Group the events by person as sort keys; purchases keep their price and
