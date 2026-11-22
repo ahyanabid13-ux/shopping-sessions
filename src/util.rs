@@ -64,6 +64,8 @@ mod ffi {
     pub const MREMAP_MAYMOVE: i32 = 1;
     #[cfg(target_os = "linux")]
     const MADV_HUGEPAGE: i32 = 14;
+    #[cfg(target_os = "linux")]
+    pub const MADV_DONTNEED: i32 = 4;
 
     /// Asks for transparent huge pages (Linux only; a no-op elsewhere).
     #[inline]
@@ -205,6 +207,31 @@ impl Mmap {
             return Err(io::Error::last_os_error());
         }
         Ok(Mmap { ptr: ptr as *const u8, len })
+    }
+
+    /// Gives back the pages of `bytes()[start..end)` once they have been
+    /// parsed: only the whole pages inside the range (through the end of the
+    /// file when `end` reaches it). The mapping stays valid, and a page that
+    /// is read again is simply mapped again from the page cache, so this
+    /// never changes what a reader sees. Unmapping 4 KiB pages is the bulk
+    /// of the process's exit time (25 ms per 2 GiB of input, on one thread);
+    /// done here it runs on every parse thread while there is other work.
+    #[inline]
+    pub fn release(&self, start: usize, end: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            const PAGE: usize = 4096;
+            if self.len == 0 {
+                return;
+            }
+            let from = (start + PAGE - 1) & !(PAGE - 1);
+            let to = if end >= self.len { (self.len + PAGE - 1) & !(PAGE - 1) } else { end & !(PAGE - 1) };
+            if to > from {
+                unsafe { ffi::madvise(self.ptr.add(from) as *mut _, to - from, ffi::MADV_DONTNEED) };
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (start, end);
     }
 
     #[inline]

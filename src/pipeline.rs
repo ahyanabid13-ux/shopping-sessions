@@ -754,6 +754,8 @@ pub fn run() {
             } else {
                 parser.clicks_segment(d, seg, &link_table, bits2, &mut cks);
             }
+            // Nothing points into the segment any more (records are copies).
+            maps[seg.file].release(seg.start, seg.end);
         }
         evs.finish();
         evs_l.finish();
