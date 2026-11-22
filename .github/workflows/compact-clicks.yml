@@ -1,0 +1,33 @@
+name: Compact click record experiment
+
+on:
+  push:
+    branches:
+      - perf-compact-clicks-20261121
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/compact-clicks.yml'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Release unit tests
+        run: cargo test --release --locked
+      - name: Build scorer binary
+        run: cargo build --release --locked
+      - name: Install fixture comparison library
+        run: python3 -m pip install --user 'polars>=1.20,<2'
+      - name: Verify all exact-output fixtures
+        run: python3 scripts/run_fixtures.py fixtures -- ./target/release/sessions
