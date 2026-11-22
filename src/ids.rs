@@ -5,13 +5,22 @@
 //! all digit strings (every 1-digit string, then every 2-digit one, ...)
 //! plus one, so it is never 0. Any other string (upper-case variants,
 //! spaces, carriage returns, anything) is interned and becomes an "odd" key:
-//! bit 42 plus its index in the interner. Both forms are injective, below
-//! 2^43, and turn back into the exact original bytes.
+//! bit 42 plus its index in the interner. A user ID that is `u` + exactly 32
+//! lowercase hex digits (a "long" ID) gets a slot in the lock-free
+//! `LongTable` instead (long.rs) and becomes bits 42 and 41 plus that slot
+//! (event and click IDs of that shape are carried as their 128-bit value).
+//! All forms are injective, below 2^43, and turn back into the exact bytes.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
+use crate::long::LongTable;
+
 pub const ODD: u64 = 1 << 42;
+/// With ODD: a long user ID, whose low 41 bits are its `LongTable` slot.
+pub const LONG: u64 = 1 << 41;
 /// Keys use the low 43 bits.
 pub const KEY_BITS: u32 = 43;
 
@@ -73,134 +82,102 @@ pub fn fast_key(b: &[u8], prefix: u8) -> u64 {
 }
 
 /// Thread-safe store of the "odd" ID strings. Rare by construction.
-/// Interns IDs that are not "fast" keys. Since scorer V5, one in eight
-/// distinct IDs is a prefix and 32 hex characters, so this is a hot path.
+/// Interns IDs that are not "fast" keys (since scorer V5, one in eight
+/// distinct IDs carries a 32-character hex suffix, so this is a hot path).
 ///
-/// 64 shards, each behind its own lock, chosen by a fast hash. Each shard
-/// appends every distinct string once to a byte arena (4-byte length, then
-/// the bytes) and indexes it with an open-addressing table of
-/// `fingerprint << 36 | offset` words (0 = empty; offset 0 is a dummy byte).
-/// The key is `ODD | shard << 36 | offset`: exact, unique, and it locates the
-/// bytes directly, so nothing is copied for readers (see `OddView`).
+/// 64 shards, each its own lock, chosen by a fast hash: parse threads rarely
+/// contend. Keys come from one atomic counter, so they are unique and dense
+/// and `snapshot()` keeps its flat layout (index = key without ODD). One heap
+/// allocation per distinct string.
 pub struct Interner {
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<Mutex<HashMap<Box<[u8]>, u64, FastBuild>>>,
+    next: AtomicU64,
 }
 
 const SHARDS: usize = 64;
-const OFF_BITS: u32 = 36;
-const OFF_MASK: u64 = (1 << OFF_BITS) - 1;
 
-struct Shard {
-    table: Vec<u64>,
-    count: usize,
-    arena: Vec<u8>,
-}
+/// A fast, non-cryptographic hash (multiply-rotate over 8-byte words). The
+/// inputs are IDs from the dataset; there is no adversarial-hashing concern.
+#[derive(Default, Clone, Copy)]
+pub struct FastBuild;
 
-/// Fast non-cryptographic hash of an ID (multiply-rotate over 8-byte words,
-/// then an avalanche). Inputs are dataset IDs; no adversarial concern.
-#[inline]
-pub fn hash_bytes(bytes: &[u8]) -> u64 {
-    const K: u64 = 0x517c_c1b7_2722_0a95;
-    let mut h = bytes.len() as u64;
-    let mut chunks = bytes.chunks_exact(8);
-    for c in &mut chunks {
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
-    }
-    let rest = chunks.remainder();
-    let mut tail = [0u8; 8];
-    tail[..rest.len()].copy_from_slice(rest);
-    h = (h.rotate_left(5) ^ u64::from_le_bytes(tail)).wrapping_mul(K);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h
-}
+pub struct FastHasher(u64);
 
-impl Shard {
+impl std::hash::BuildHasher for FastBuild {
+    type Hasher = FastHasher;
     #[inline]
-    fn bytes_at(&self, off: u64) -> &[u8] {
-        let o = off as usize;
-        let len = u32::from_le_bytes(self.arena[o..o + 4].try_into().unwrap()) as usize;
-        &self.arena[o + 4..o + 4 + len]
+    fn build_hasher(&self) -> FastHasher {
+        FastHasher(0)
     }
+}
 
-    fn grow(&mut self) {
-        let cap = self.table.len() * 2;
-        let mut table = vec![0u64; cap];
-        let mask = cap - 1;
-        for &e in &self.table {
-            if e != 0 {
-                let h = hash_bytes(self.bytes_at(e & OFF_MASK));
-                let mut i = h as usize & mask;
-                while table[i] != 0 {
-                    i = (i + 1) & mask;
-                }
-                table[i] = e;
-            }
-        }
-        self.table = table;
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // Final avalanche so the low bits (hashbrown's buckets) are mixed.
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x
     }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+        }
+        let rest = chunks.remainder();
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(tail) ^ (bytes.len() as u64) << 56).wrapping_mul(K);
+        self.0 = h;
+    }
+}
+
+#[inline]
+fn hash_bytes(b: &[u8]) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = FastBuild.build_hasher();
+    b.hash(&mut h);
+    h.finish()
 }
 
 impl Interner {
-    /// `expected`: a rough count of distinct odd IDs, to size the tables.
-    pub fn new(expected: usize) -> Self {
-        let per = ((expected / SHARDS) * 2).max(64).next_power_of_two();
+    pub fn new() -> Self {
         Interner {
-            shards: (0..SHARDS)
-                .map(|_| Mutex::new(Shard { table: vec![0; per], count: 0, arena: vec![0u8] }))
-                .collect(),
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::with_hasher(FastBuild))).collect(),
+            next: AtomicU64::new(0),
         }
     }
 
-    /// The odd key of `b` (bit 42 set).
+    /// The odd key of `b` (bit 42 set, bit 41 clear).
     pub fn intern(&self, b: &[u8]) -> u64 {
-        let h = hash_bytes(b);
-        let shard = (h >> 58) as usize % SHARDS;
-        let fp = (h >> 30) & ((1 << 28) - 1);
-        let mut sh = self.shards[shard].lock().unwrap();
-        let mask = sh.table.len() - 1;
-        let mut i = h as usize & mask;
-        loop {
-            let e = sh.table[i];
-            if e == 0 {
-                break;
-            }
-            if e >> OFF_BITS == fp && sh.bytes_at(e & OFF_MASK) == b {
-                return ODD | (shard as u64) << OFF_BITS | (e & OFF_MASK);
-            }
-            i = (i + 1) & mask;
+        let shard = (hash_bytes(b) >> 58) as usize % SHARDS;
+        let mut map = self.shards[shard].lock().unwrap();
+        if let Some(&id) = map.get(b) {
+            return ODD | id;
         }
-        let off = sh.arena.len() as u64;
-        assert!(off + 4 + b.len() as u64 <= OFF_MASK, "odd-ID arena full");
-        sh.arena.extend_from_slice(&(b.len() as u32).to_le_bytes());
-        sh.arena.extend_from_slice(b);
-        sh.table[i] = fp << OFF_BITS | off;
-        sh.count += 1;
-        if sh.count * 2 > sh.table.len() {
-            sh.grow();
-        }
-        ODD | (shard as u64) << OFF_BITS | off
+        let id = self.next.fetch_add(1, AtomicOrdering::Relaxed);
+        assert!(id < LONG, "too many distinct odd IDs");
+        map.insert(b.into(), id);
+        ODD | id
     }
 
-    /// Read access to every interned string. Holds every shard's lock, so
-    /// take it only while no thread interns (between phases), and drop it
-    /// before interning again.
-    pub fn view(&self) -> OddView<'_> {
-        OddView { shards: self.shards.iter().map(|m| m.lock().unwrap()).collect() }
-    }
-}
-
-/// The bytes behind odd keys (see `Interner::view`).
-pub struct OddView<'a> {
-    shards: Vec<std::sync::MutexGuard<'a, Shard>>,
-}
-
-impl OddView<'_> {
-    #[inline]
-    pub fn get(&self, key: u64) -> &[u8] {
-        let shard = ((key >> OFF_BITS) as usize) & (SHARDS - 1);
-        self.shards[shard].bytes_at(key & OFF_MASK)
+    /// A frozen copy of every odd string, indexed by odd key.
+    pub fn snapshot(&self) -> Vec<Vec<u8>> {
+        // Lock every shard first so the counter and the maps agree.
+        let guards: Vec<_> = self.shards.iter().map(|m| m.lock().unwrap()).collect();
+        let n = self.next.load(AtomicOrdering::Relaxed) as usize;
+        let mut out = vec![Vec::new(); n];
+        for g in &guards {
+            for (bytes, &id) in g.iter() {
+                out[id as usize] = bytes.to_vec();
+            }
+        }
+        out
     }
 }
 
@@ -216,9 +193,9 @@ pub fn key_of(b: &[u8], prefix: u8, interner: &Interner) -> u64 {
 }
 
 /// Appends the exact bytes of `key` to `out`.
-pub fn write_id(out: &mut Vec<u8>, key: u64, prefix: u8, odd: &OddView) {
+pub fn write_id(out: &mut Vec<u8>, key: u64, prefix: u8, odd: &[Vec<u8>]) {
     if key & ODD != 0 {
-        out.extend_from_slice(odd.get(key));
+        out.extend_from_slice(&odd[(key & !ODD) as usize]);
         return;
     }
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -262,8 +239,67 @@ pub fn key_of_order(order: u64) -> u64 {
     fast_from(len, (order >> 4) / POW36[8 - len])
 }
 
+/// Whether `key` is a long user key (`ODD | LONG | slot`).
+#[inline(always)]
+pub fn is_long(key: u64) -> bool {
+    key & (ODD | LONG) == ODD | LONG
+}
+
+/// The coarse order key of a long ID whose first 16 hex digits are `hi`: its
+/// first 8 digits read as base-36 digits, shifted like `order_key`, with 15
+/// as the length. Against `order_key` of a fast ID it orders exactly like the
+/// bytes (a tie in the padded value makes the short ID a prefix, and its
+/// length <= 8 < 15); two long IDs with equal first 8 digits tie.
+#[inline]
+pub fn long_order(hi: u64) -> u64 {
+    let mut p8 = 0u64;
+    for i in 0..8 {
+        p8 = p8 * 36 + (hi >> (60 - 4 * i) & 15);
+    }
+    p8 << 4 | 15
+}
+
+/// Appends `prefix` and the 32 hex digits of (hi, lo).
+pub fn write_long(out: &mut Vec<u8>, prefix: u8, hi: u64, lo: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(prefix);
+    for w in [hi, lo] {
+        for i in 0..16 {
+            out.push(HEX[(w >> (60 - 4 * i) & 15) as usize]);
+        }
+    }
+}
+
+/// Appends the exact bytes of the user key `key` (fast, odd or long).
+pub fn write_user_id(out: &mut Vec<u8>, key: u64, odd: &[Vec<u8>], longs: &LongTable) {
+    if is_long(key) {
+        let (hi, lo) = longs.value((key & (LONG - 1)) as usize);
+        write_long(out, b'u', hi, lo);
+    } else {
+        write_id(out, key, b'u', odd);
+    }
+}
+
+/// Byte-wise order of the user IDs of keys `a` and `b`.
+pub fn cmp_user_ids(a: u64, b: u64, odd: &[Vec<u8>], longs: &LongTable) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    if a & ODD == 0 && b & ODD == 0 {
+        return cmp_ids(a, b, b'u', odd);
+    }
+    if is_long(a) && is_long(b) {
+        return longs.value((a & (LONG - 1)) as usize).cmp(&longs.value((b & (LONG - 1)) as usize));
+    }
+    let mut sa = Vec::with_capacity(40);
+    let mut sb = Vec::with_capacity(40);
+    write_user_id(&mut sa, a, odd, longs);
+    write_user_id(&mut sb, b, odd, longs);
+    sa.cmp(&sb)
+}
+
 /// Byte-wise order of the two IDs `a` and `b` (both written with `prefix`).
-pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &OddView) -> Ordering {
+pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &[Vec<u8>]) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
@@ -287,9 +323,9 @@ pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &OddView) -> Ordering {
 
 /// The bytes of a fast or odd key; fast keys are spelled into `buf`.
 #[inline]
-fn id_bytes<'a>(key: u64, prefix: u8, odd: &'a OddView, buf: &'a mut [u8; 9]) -> &'a [u8] {
+fn id_bytes<'a>(key: u64, prefix: u8, odd: &'a [Vec<u8>], buf: &'a mut [u8; 9]) -> &'a [u8] {
     if key & ODD != 0 {
-        return odd.get(key);
+        return &odd[(key & !ODD) as usize];
     }
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let (len, mut value) = fast_parts(key);
@@ -306,76 +342,98 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interner_exact_under_growth() {
-        let interner = Interner::new(1); // tiny: forces many rehashes
-        let mut seed = 0x1234_5678_9abc_def0u64;
-        let mut rnd = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        let mut strings: Vec<Vec<u8>> = Vec::new();
-        for i in 0..300_000u64 {
-            let s = if i % 3 == 0 {
-                // V5-style: prefix + 32 hex characters.
-                let mut v = vec![b'u'];
-                v.extend(format!("{:016x}{:016x}", rnd(), rnd()).bytes());
-                v
-            } else {
-                let n = (rnd() % 40) as usize;
-                (0..n).map(|_| [b'a', b'Z', b' ', 0xC3, 0xA9, b'\r', b'0', b'k'][(rnd() % 8) as usize]).collect()
-            };
-            strings.push(s);
-        }
-        // Repeats: intern a random earlier string again.
-        let mut keys = Vec::new();
-        for (i, s) in strings.iter().enumerate() {
-            keys.push(interner.intern(s));
-            if i % 7 == 0 {
-                let j = (rnd() % (i as u64 + 1)) as usize;
-                assert_eq!(interner.intern(&strings[j]), keys[j], "stable key");
-            }
-        }
-        let view = interner.view();
-        for (s, &k) in strings.iter().zip(&keys) {
-            assert!(k & ODD != 0 && k < (1 << KEY_BITS));
-            assert_eq!(view.get(k), &s[..], "round trip");
-        }
-        let mut by_key = std::collections::HashMap::new();
-        for (s, &k) in strings.iter().zip(&keys) {
-            if let Some(prev) = by_key.insert(k, s.clone()) {
-                assert_eq!(&prev, s, "two strings share a key");
-            }
-        }
-        let distinct: std::collections::HashSet<&Vec<u8>> = strings.iter().collect();
-        assert_eq!(by_key.len(), distinct.len(), "one key per distinct string");
-    }
-
-    #[test]
     fn roundtrip_and_order() {
-        let interner = Interner::new(4);
-        let ids: Vec<&[u8]> = vec![
-            b"u1", b"u10", b"u9", b"u0", b"u00", b"u000a", b"uzzzzzzzz", b"u00000000", b"U1", b"u1 ", b" u1",
+        let interner = Interner::new();
+        let longs = LongTable::new(64);
+        // `u` + head, padded with '0' to 33 bytes but ending in '1' (a zero
+        // half would send the ID to the interner).
+        let z = |head: &str| -> Vec<u8> {
+            let mut v = format!("u{head}").into_bytes();
+            if v.len() < 33 {
+                v.resize(33, b'0');
+                v[32] = b'1';
+            }
+            v
+        };
+        let mut ids: Vec<Vec<u8>> = [
+            &b"u1"[..], b"u10", b"u9", b"u0", b"u00", b"u000a", b"uzzzzzzzz", b"u00000000", b"U1", b"u1 ", b" u1",
             b"u", b"uA", b"u123456789", b"e1", b"\tB", b"u0a", b"u0", b"uzzzzzzz", b"u0000000", b"u10000000",
-            b"uz", b"u00", b"u0z",
-        ];
-        let keys: Vec<u64> = ids.iter().map(|s| key_of(s, b'u', &interner)).collect();
-        let odd = interner.view();
+            b"uz", b"u00", b"u0z", b"u0a1b",
+        ]
+        .iter()
+        .map(|s| s.to_vec())
+        .collect();
+        ids.extend([
+            z("0a1b"),
+            z("0a1b0000000000000000000000000001"),
+            z("0a1b2c3d"),
+            z("0a1b2c3d1"),
+            z("0a1b2c3d0000000000000000000000ff"),
+            z("0a1b2c3e"),
+            z("ffffffffffffffffffffffffffffffff"),
+            z("f"),
+            z("9"),
+            z("1"),
+            z("00000001"),
+            z("0a1b2c3"),
+            z("0000000000000000000000000000001"), // hi == 0: falls back to the interner
+            z(""),                                // hi == 0: interner
+            [&b"u"[..], &[b'0'; 32]].concat(),     // all zero: interner
+            [&b"u12345678"[..], &[b'0'; 24]].concat(), // lo == 0: interner
+            b"U0A1B0000000000000000000000000000".to_vec(),
+            b"u0A1B0000000000000000000000000000".to_vec(),
+            b"u0a1b00000000000000000000000000000".to_vec(),
+            b"u0a1b2c3d".to_vec(),
+            b"u0a1b2c3e".to_vec(),
+            b"uf".to_vec(),
+            b"ug".to_vec(),
+        ]);
+        let key_of_user = |s: &[u8]| -> u64 {
+            if let Some((hi, lo)) = crate::fast::hex_key(s, 0, s.len(), b'u') {
+                if let Some(slot) = longs.slot(hi, lo) {
+                    return ODD | LONG | slot as u64;
+                }
+            }
+            key_of(s, b'u', &interner)
+        };
+        let keys: Vec<u64> = ids.iter().map(|s| key_of_user(s)).collect();
+        assert!(keys.iter().filter(|&&k| is_long(k)).count() >= 10);
+        let odd = interner.snapshot();
         for (s, &k) in ids.iter().zip(&keys) {
             let mut out = Vec::new();
-            write_id(&mut out, k, b'u', &odd);
-            assert_eq!(&out[..], *s);
+            write_user_id(&mut out, k, &odd, &longs);
+            assert_eq!(&out[..], &s[..]);
             if k & ODD == 0 {
+                out.clear();
+                write_id(&mut out, k, b'u', &odd);
+                assert_eq!(&out[..], &s[..]);
                 assert_eq!(key_of_order(order_key(k)), k);
             }
         }
+        // The order number of a fast key or the coarse one of a long key.
+        let coarse = |k: u64| -> Option<u64> {
+            if k & ODD == 0 {
+                Some(order_key(k))
+            } else if is_long(k) {
+                Some(long_order(longs.value((k & (LONG - 1)) as usize).0))
+            } else {
+                None
+            }
+        };
         for (i, &a) in keys.iter().enumerate() {
             for (j, &b) in keys.iter().enumerate() {
-                assert_eq!(cmp_ids(a, b, b'u', &odd), ids[i].cmp(ids[j]), "{:?} {:?}", ids[i], ids[j]);
+                let want = ids[i].cmp(&ids[j]);
+                assert_eq!(cmp_user_ids(a, b, &odd, &longs), want, "{:?} {:?}", ids[i], ids[j]);
                 assert_eq!(a == b, ids[i] == ids[j]);
                 if a & ODD == 0 && b & ODD == 0 {
-                    assert_eq!(order_key(a).cmp(&order_key(b)), ids[i].cmp(ids[j]));
+                    assert_eq!(cmp_ids(a, b, b'u', &odd), want);
+                    assert_eq!(order_key(a).cmp(&order_key(b)), want);
+                }
+                if let (Some(oa), Some(ob)) = (coarse(a), coarse(b)) {
+                    if is_long(a) && is_long(b) && oa == ob {
+                        continue; // decided by the full value
+                    }
+                    assert_eq!(oa.cmp(&ob), want, "{:?} {:?}", ids[i], ids[j]);
                 }
             }
         }

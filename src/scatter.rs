@@ -41,8 +41,12 @@ impl<T: Copy> Scatter<T> {
     /// `parts` partitions; `expected` records in total (sizes the regions).
     pub fn new(parts: usize, expected: usize) -> Self {
         let size = std::mem::size_of::<T>();
-        assert!(size > 0 && size <= 64 && 64 % size == 0 || size == 24, "record size {size} not supported");
-        let group = if size == 24 { 8 } else { 64 / size };
+        assert!(size > 0 && size <= 64 && 64 % size == 0 || size == 24 || size == 48, "record size {size} not supported");
+        let group = match size {
+            24 => 8,
+            48 => 4,
+            _ => 64 / size,
+        };
         assert!(group * size <= 192 && (group * size) % 64 == 0);
         let stage_bytes = group * size;
         // Chunks near a quarter of what one partition receives, 4..64 KiB, so

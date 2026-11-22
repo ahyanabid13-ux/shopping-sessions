@@ -4,6 +4,7 @@
 
 use crate::ids;
 use crate::links::PERSON_MASK;
+use crate::long::LongTable;
 use crate::ts::DAY;
 use crate::util::{fib, take};
 
@@ -18,8 +19,9 @@ pub struct Ev2 {
 }
 
 /// A valid click: person key, click key (for ties), time since `base`,
-/// campaign index (1..). Padded to 32 bytes for the scatter's cache-line
-/// staging.
+/// campaign index (1..). 32 bytes for the scatter's cache-line staging.
+/// A long click ID (`k` + 32 hex digits) sets CLICK_LONG in `pk` and keeps
+/// its value in `key` (first 16 digits) and `key2`; otherwise `key2` is 0.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Ck2 {
@@ -27,7 +29,31 @@ pub struct Ck2 {
     pub key: u64,
     pub t: u32,
     pub campaign: u32,
-    pub _pad: u64,
+    pub key2: u64,
+}
+
+/// In `Ck2::pk`, above the person key (which uses the low 44 bits).
+pub const CLICK_LONG: u64 = 1 << 63;
+
+/// Whether click `a`'s click_id is byte-wise less than click `b`'s.
+fn click_id_less(a: &Ck2, b: &Ck2, odd: &[Vec<u8>]) -> bool {
+    match (a.pk & CLICK_LONG != 0, b.pk & CLICK_LONG != 0) {
+        (true, true) => (a.key, a.key2) < (b.key, b.key2),
+        (false, false) => ids::cmp_ids(a.key, b.key, b'k', odd) == std::cmp::Ordering::Less,
+        _ => {
+            let write = |c: &Ck2, out: &mut Vec<u8>| {
+                if c.pk & CLICK_LONG != 0 {
+                    ids::write_long(out, b'k', c.key, c.key2);
+                } else {
+                    ids::write_id(out, c.key, b'k', odd);
+                }
+            };
+            let (mut sa, mut sb) = (Vec::with_capacity(40), Vec::with_capacity(40));
+            write(a, &mut sa);
+            write(b, &mut sb);
+            sa < sb
+        }
+    }
 }
 
 pub const NO_CATEGORY: u16 = u16::MAX;
@@ -52,7 +78,8 @@ pub struct Ctx<'a> {
     pub first_day: i64,
     pub days: usize,
     pub campaigns: usize,
-    pub odd: &'a crate::ids::OddView<'a>,
+    pub odd: &'a [Vec<u8>],
+    pub longs: &'a LongTable,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -407,7 +434,7 @@ fn person(
             let mut k = hi - 1;
             while k > lo && cks[k - 1].t == latest {
                 k -= 1;
-                if ids::cmp_ids(cks[k].key, cks[best].key, b'k', ctx.odd) == std::cmp::Ordering::Less {
+                if click_id_less(&cks[k], &cks[best], ctx.odd) {
                     best = k;
                 }
             }
@@ -447,4 +474,52 @@ fn finish_row(mut r: UdRow, category_sums: &mut Vec<(u16, u64)>) -> UdRow {
     r.top = best.map_or(NO_CATEGORY, |(c, _)| c);
     category_sums.clear();
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn click_ids_order_like_bytes() {
+        let interner = ids::Interner::new();
+        let mut ids_: Vec<Vec<u8>> = vec![
+            b"k0".to_vec(),
+            b"k0a1b".to_vec(),
+            b"k0a1b2c3d".to_vec(),
+            b"kzzzzzzzz".to_vec(),
+            b"kf".to_vec(),
+            b"kg".to_vec(),
+            b"K0A1B".to_vec(),
+            b"k0a1b2c3d0000000000000000000000000".to_vec(),
+            b"k0A1B2c3d000000000000000000000000".to_vec(),
+        ];
+        for head in ["0a1b", "0a1b2c3d", "0a1b2c3d1", "0a1b2c3e", "f", "ffffffff", "1", ""] {
+            let mut v = format!("k{head}").into_bytes();
+            v.resize(33, b'0');
+            ids_.push(v.clone());
+            *v.last_mut().unwrap() = b'7';
+            ids_.push(v);
+        }
+        let cks: Vec<Ck2> = ids_
+            .iter()
+            .map(|s| {
+                let k = ids::fast_key(s, b'k');
+                if k != 0 {
+                    return Ck2 { key: k, ..Default::default() };
+                }
+                if let Some((hi, lo)) = crate::fast::hex_key(s, 0, s.len(), b'k') {
+                    return Ck2 { pk: CLICK_LONG | 12345, key: hi, key2: lo, ..Default::default() };
+                }
+                Ck2 { key: interner.intern(s), ..Default::default() }
+            })
+            .collect();
+        assert!(cks.iter().filter(|c| c.pk & CLICK_LONG != 0).count() >= 14);
+        let odd = interner.snapshot();
+        for i in 0..cks.len() {
+            for j in 0..cks.len() {
+                assert_eq!(click_id_less(&cks[i], &cks[j], &odd), ids_[i] < ids_[j], "{:?} {:?}", ids_[i], ids_[j]);
+            }
+        }
+    }
 }

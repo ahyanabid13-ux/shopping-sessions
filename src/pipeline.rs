@@ -14,9 +14,10 @@ use std::time::Instant;
 use crate::fast;
 use crate::ids::{self, Interner};
 use crate::links::{self, LinkTable, PERSON_MASK};
+use crate::long::LongTable;
 use crate::lookup::{self, Campaigns, Products, NOT_A_CAMPAIGN};
 use crate::output;
-use crate::person::{self, Ck2, Ev2, REACH_MS};
+use crate::person::{self, Ck2, Ev2, CLICK_LONG, REACH_MS};
 use crate::scatter::Scatter;
 use crate::ts::DAY;
 use crate::util::{fib, par_run, take, thread_count, Mmap};
@@ -57,6 +58,75 @@ pub struct Ev1 {
 }
 
 const VALID: u64 = 1 << 63;
+/// In a pending record's `tp`: the event_id is long (`key`, `key2` hold it).
+const LONG_EVENT: u64 = 1 << 62;
+/// In a pending record's `tp`: the user_id is long (`uhi`, `ulo` hold it).
+const LONG_USER: u64 = 1 << 61;
+/// In a pending click's `pk`: the user_id is long.
+const CK_LONG_USER: u64 = 1 << 62;
+
+/// An event copy whose event_id is long (`e` + 32 hex digits), before dedup.
+/// Same fields as `Ev1`, with the 128-bit ID in (hi, lo).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct Ev1L {
+    hi: u64,
+    lo: u64,
+    ingest: i64,
+    pk: u64,
+    tp: u64,
+    _pad: u64,
+}
+
+/// An event copy as parsed: `key` (or `key`, `key2` when LONG_EVENT), and
+/// for a valid copy its user key and category in `pk`, or the category in
+/// `pk` and the long user ID in (`uhi`, `ulo`) when LONG_USER.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Pend {
+    key: u64,
+    key2: u64,
+    ingest: i64,
+    pk: u64,
+    uhi: u64,
+    ulo: u64,
+    tp: u64,
+    _pad: u64,
+}
+
+/// Partition (and dedup hash) of a long event ID.
+#[inline(always)]
+fn long_hash(hi: u64, lo: u64) -> u64 {
+    fib(lo ^ fib(hi))
+}
+
+/// Person key of the long user ID (hi, lo): its linked person, else its
+/// own `LongTable` key, or through the exact interner when the table
+/// refuses it.
+#[inline(always)]
+fn long_person(longs: &LongTable, links: &LinkTable, interner: &Interner, hi: u64, lo: u64) -> u64 {
+    match longs.slot(hi, lo) {
+        Some(s) => {
+            let p = longs.person(s);
+            if p != 0 {
+                p
+            } else {
+                ids::ODD | ids::LONG | s as u64
+            }
+        }
+        None => links.person_of(intern_long(interner, hi, lo)),
+    }
+}
+
+/// The odd key of the long user ID (hi, lo), from its exact bytes (`hex_key`
+/// accepts only the canonical form, so they are rebuilt exactly).
+#[cold]
+#[inline(never)]
+fn intern_long(interner: &Interner, hi: u64, lo: u64) -> u64 {
+    let mut b = Vec::with_capacity(33);
+    ids::write_long(&mut b, b'u', hi, lo);
+    interner.intern(&b)
+}
 
 struct Segment {
     file: usize,
@@ -108,6 +178,7 @@ fn first_line(data: &[u8], start: usize) -> usize {
 }
 
 struct Parser<'a> {
+    dates: fast::WindowDates,
     window_start: i64,
     window_end: i64,
     click_start: i64,
@@ -115,17 +186,23 @@ struct Parser<'a> {
     products: &'a Products,
     campaigns: &'a Campaigns,
     interner: &'a Interner,
+    longs: &'a LongTable,
 }
 
 impl Parser<'_> {
+    /// User key of a link side: fast, long (its `LongTable` slot), or interned.
     #[inline(always)]
-    fn key(&self, d: &[u8], s: usize, e: usize, prefix: u8) -> u64 {
-        let k = fast::id_key(d, s, e, prefix);
+    fn link_key(&self, d: &[u8], s: usize, e: usize) -> u64 {
+        let k = fast::id_key(d, s, e, b'u');
         if k != 0 {
-            k
-        } else {
-            self.interner.intern(&d[s..e])
+            return k;
         }
+        if let Some((hi, lo)) = fast::hex_key(d, s, e, b'u') {
+            if let Some(slot) = self.longs.slot(hi, lo) {
+                return ids::ODD | ids::LONG | slot as u64;
+            }
+        }
+        self.interner.intern(&d[s..e])
     }
 
     #[inline(always)]
@@ -145,20 +222,30 @@ impl Parser<'_> {
     }
 
     /// One well-formed event line. None when its event_id is empty. A valid
-    /// copy comes back with VALID set and its user key (and category) in `pk`.
+    /// copy comes back with VALID set and its user key (and category) in `pk`
+    /// (see `Pend` for long IDs).
     #[inline(always)]
-    fn event(&self, d: &[u8], fs: &[usize; 7], fe: &[usize; 7]) -> Option<Ev1> {
+    fn event(&self, d: &[u8], fs: &[usize; 7], fe: &[usize; 7]) -> Option<Pend> {
         if fs[0] == fe[0] {
             return None;
         }
         // rules.md: ingest_ts is always valid F1. A line without one cannot be ordered.
-        let ingest = fast::timestamp(d, fs[3], fe[3])?;
-        let key = self.key(d, fs[0], fe[0], b'e');
-        let mut rec = Ev1 { key, ingest, pk: 0, tp: 0 };
+        let ingest = self.dates.parse(d, fs[3], fe[3])?;
+        let mut rec = Pend { ingest, ..Pend::default() };
+        let k = fast::id_key(d, fs[0], fe[0], b'e');
+        if k != 0 {
+            rec.key = k;
+        } else if let Some((hi, lo)) = fast::hex_key(d, fs[0], fe[0], b'e') {
+            rec.key = hi;
+            rec.key2 = lo;
+            rec.tp = LONG_EVENT;
+        } else {
+            rec.key = self.interner.intern(&d[fs[0]..fe[0]]);
+        }
         if fs[1] == fe[1] || fs[5] == fe[5] {
             return Some(rec);
         }
-        let Some(t) = fast::timestamp(d, fs[2], fe[2]) else { return Some(rec) };
+        let Some(t) = self.dates.parse(d, fs[2], fe[2]) else { return Some(rec) };
         if t < self.window_start || t >= self.window_end {
             return Some(rec);
         }
@@ -190,19 +277,30 @@ impl Parser<'_> {
         if ingest - t > LATE_MS {
             return Some(rec);
         }
-        rec.pk = self.key(d, fs[1], fe[1], b'u') | (category as u64) << 48;
-        rec.tp = (t - self.base) as u64 | amount << 32 | VALID;
+        let uk = fast::id_key(d, fs[1], fe[1], b'u');
+        if uk != 0 {
+            rec.pk = uk;
+        } else if let Some((hi, lo)) = fast::hex_key(d, fs[1], fe[1], b'u') {
+            rec.uhi = hi;
+            rec.ulo = lo;
+            rec.tp |= LONG_USER;
+        } else {
+            rec.pk = self.interner.intern(&d[fs[1]..fe[1]]);
+        }
+        rec.pk |= (category as u64) << 48;
+        rec.tp |= (t - self.base) as u64 | amount << 32 | VALID;
         Some(rec)
     }
 
     /// One well-formed click line: Some only for a valid click, with its
-    /// user key in `pk`.
+    /// user key in `pk`, or CK_LONG_USER in `pk` and the long user ID in the
+    /// other two values. A long click_id sets CLICK_LONG (see `Ck2`).
     #[inline(always)]
-    fn click(&self, d: &[u8], fs: &[usize; 4], fe: &[usize; 4]) -> Option<Ck2> {
+    fn click(&self, d: &[u8], fs: &[usize; 4], fe: &[usize; 4]) -> Option<(Ck2, u64, u64)> {
         if fs[0] == fe[0] || fs[1] == fe[1] {
             return None;
         }
-        let t = fast::timestamp(d, fs[3], fe[3])?;
+        let t = self.dates.parse(d, fs[3], fe[3])?;
         if t < self.click_start || t >= self.window_end {
             return None;
         }
@@ -210,9 +308,28 @@ impl Parser<'_> {
         if c == NOT_A_CAMPAIGN {
             return None;
         }
-        let key = self.key(d, fs[0], fe[0], b'k');
-        let user = self.key(d, fs[1], fe[1], b'u');
-        Some(Ck2 { pk: user, key, t: (t - self.base) as u32, campaign: c, _pad: 0 })
+        let mut ck = Ck2 { pk: 0, key: 0, t: (t - self.base) as u32, campaign: c, key2: 0 };
+        let k = fast::id_key(d, fs[0], fe[0], b'k');
+        if k != 0 {
+            ck.key = k;
+        } else if let Some((hi, lo)) = fast::hex_key(d, fs[0], fe[0], b'k') {
+            ck.key = hi;
+            ck.key2 = lo;
+            ck.pk = CLICK_LONG;
+        } else {
+            ck.key = self.interner.intern(&d[fs[0]..fe[0]]);
+        }
+        let (mut uhi, mut ulo) = (0, 0);
+        let uk = fast::id_key(d, fs[1], fe[1], b'u');
+        if uk != 0 {
+            ck.pk |= uk;
+        } else if let Some((hi, lo)) = fast::hex_key(d, fs[1], fe[1], b'u') {
+            (uhi, ulo) = (hi, lo);
+            ck.pk |= CK_LONG_USER;
+        } else {
+            ck.pk |= self.interner.intern(&d[fs[1]..fe[1]]);
+        }
+        Some((ck, uhi, ulo))
     }
 }
 
@@ -292,15 +409,20 @@ fn lines_with<const N: usize, const PDEP: bool, S: LineSink<N>>(d: &[u8], seg: &
 }
 
 /// Per-segment state of the events parse: valid copies wait LOOKAHEAD
-/// records in a ring after their person-table line is prefetched.
+/// records in a ring after their person-table line is prefetched. Copies
+/// with a long event or user ID use a second ring of wider records.
 struct EventSink<'p, 'a> {
     parser: &'p Parser<'a>,
     d: &'p [u8],
     links: &'p LinkTable,
     bits1: u32,
+    bits_l: u32,
     out: &'p mut Scatter<Ev1>,
+    out_l: &'p mut Scatter<Ev1L>,
     ring: [Ev1; LOOKAHEAD],
     count: usize,
+    wide: [Pend; LOOKAHEAD],
+    wide_count: usize,
 }
 
 impl EventSink<'_, '_> {
@@ -310,27 +432,73 @@ impl EventSink<'_, '_> {
         r.pk = links.person_of(r.pk & USER_MASK) | (r.pk & !PERSON_MASK);
         out.push(take(fib(r.key), 0, bits1), r);
     }
+
+    /// A valid copy from the wide ring, to `out` or (long event ID) `out_l`.
+    #[inline(always)]
+    fn resolve_wide(parser: &Parser, links: &LinkTable, bits1: u32, bits_l: u32, p: Pend, out: &mut Scatter<Ev1>, out_l: &mut Scatter<Ev1L>) {
+        let person = if p.tp & LONG_USER != 0 {
+            long_person(parser.longs, links, parser.interner, p.uhi, p.ulo)
+        } else {
+            links.person_of(p.pk & USER_MASK)
+        };
+        let pk = person | (p.pk & !PERSON_MASK);
+        let tp = p.tp & !(LONG_EVENT | LONG_USER);
+        if p.tp & LONG_EVENT != 0 {
+            out_l.push(take(long_hash(p.key, p.key2), 0, bits_l), Ev1L { hi: p.key, lo: p.key2, ingest: p.ingest, pk, tp, _pad: 0 });
+        } else {
+            out.push(take(fib(p.key), 0, bits1), Ev1 { key: p.key, ingest: p.ingest, pk, tp });
+        }
+    }
 }
 
 impl LineSink<7> for EventSink<'_, '_> {
     #[inline(always)]
     fn line(&mut self, fs: &[usize; 7], fe: &[usize; 7]) {
-        let Some(rec) = self.parser.event(self.d, fs, fe) else { return };
-        if rec.tp & VALID == 0 {
-            self.out.push(take(fib(rec.key), 0, self.bits1), rec);
+        let Some(p) = self.parser.event(self.d, fs, fe) else { return };
+        if p.tp & (VALID | LONG_EVENT | LONG_USER) == VALID {
+            let rec = Ev1 { key: p.key, ingest: p.ingest, pk: p.pk, tp: p.tp };
+            self.links.prefetch(rec.pk & USER_MASK);
+            let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
+            if self.count >= LOOKAHEAD {
+                Self::resolve(self.links, self.bits1, *slot, self.out);
+            }
+            *slot = rec;
+            self.count += 1;
             return;
         }
-        self.links.prefetch(rec.pk & USER_MASK);
-        let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
-        if self.count >= LOOKAHEAD {
-            Self::resolve(self.links, self.bits1, *slot, self.out);
+        if p.tp & VALID == 0 {
+            // Invalid copies still take part in the dedup (pk = tp = 0).
+            if p.tp & LONG_EVENT != 0 {
+                let rec = Ev1L { hi: p.key, lo: p.key2, ingest: p.ingest, pk: 0, tp: 0, _pad: 0 };
+                self.out_l.push(take(long_hash(p.key, p.key2), 0, self.bits_l), rec);
+            } else {
+                self.out.push(take(fib(p.key), 0, self.bits1), Ev1 { key: p.key, ingest: p.ingest, pk: 0, tp: 0 });
+            }
+            return;
         }
-        *slot = rec;
-        self.count += 1;
+        if p.tp & LONG_USER != 0 {
+            self.parser.longs.prefetch(p.uhi, p.ulo);
+        } else {
+            self.links.prefetch(p.pk & USER_MASK);
+        }
+        let slot = unsafe { self.wide.get_unchecked_mut(self.wide_count % LOOKAHEAD) };
+        if self.wide_count >= LOOKAHEAD {
+            Self::resolve_wide(self.parser, self.links, self.bits1, self.bits_l, *slot, self.out, self.out_l);
+        }
+        *slot = p;
+        self.wide_count += 1;
     }
 }
 
-/// Per-segment state of the clicks parse, with the same lookahead ring.
+/// A pending click whose user_id is long.
+#[derive(Clone, Copy, Default)]
+struct LongCk {
+    ck: Ck2,
+    uhi: u64,
+    ulo: u64,
+}
+
+/// Per-segment state of the clicks parse, with the same lookahead rings.
 struct ClickSink<'p, 'a> {
     parser: &'p Parser<'a>,
     d: &'p [u8],
@@ -339,51 +507,99 @@ struct ClickSink<'p, 'a> {
     out: &'p mut Scatter<Ck2>,
     ring: [Ck2; LOOKAHEAD],
     count: usize,
+    long_ring: [LongCk; LOOKAHEAD],
+    long_count: usize,
 }
 
 impl ClickSink<'_, '_> {
     #[inline(always)]
     fn resolve(links: &LinkTable, bits2: u32, c: Ck2, out: &mut Scatter<Ck2>) {
         let mut c = c;
-        c.pk = links.person_of(c.pk);
-        out.push(take(fib(c.pk), 0, bits2), c);
+        c.pk = links.person_of(c.pk & USER_MASK) | (c.pk & CLICK_LONG);
+        out.push(take(fib(c.pk & PERSON_MASK), 0, bits2), c);
+    }
+
+    #[inline(always)]
+    fn resolve_long(parser: &Parser, links: &LinkTable, bits2: u32, l: LongCk, out: &mut Scatter<Ck2>) {
+        let mut c = l.ck;
+        c.pk = long_person(parser.longs, links, parser.interner, l.uhi, l.ulo) | (c.pk & CLICK_LONG);
+        out.push(take(fib(c.pk & PERSON_MASK), 0, bits2), c);
     }
 }
 
 impl LineSink<4> for ClickSink<'_, '_> {
     #[inline(always)]
     fn line(&mut self, fs: &[usize; 4], fe: &[usize; 4]) {
-        let Some(c) = self.parser.click(self.d, fs, fe) else { return };
-        self.links.prefetch(c.pk);
-        let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
-        if self.count >= LOOKAHEAD {
-            Self::resolve(self.links, self.bits2, *slot, self.out);
+        let Some((c, uhi, ulo)) = self.parser.click(self.d, fs, fe) else { return };
+        if c.pk & CK_LONG_USER == 0 {
+            self.links.prefetch(c.pk & USER_MASK);
+            let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
+            if self.count >= LOOKAHEAD {
+                Self::resolve(self.links, self.bits2, *slot, self.out);
+            }
+            *slot = c;
+            self.count += 1;
+            return;
         }
-        *slot = c;
-        self.count += 1;
+        self.parser.longs.prefetch(uhi, ulo);
+        let slot = unsafe { self.long_ring.get_unchecked_mut(self.long_count % LOOKAHEAD) };
+        if self.long_count >= LOOKAHEAD {
+            Self::resolve_long(self.parser, self.links, self.bits2, *slot, self.out);
+        }
+        *slot = LongCk { ck: Ck2 { pk: c.pk & !CK_LONG_USER, ..c }, uhi, ulo };
+        self.long_count += 1;
     }
 }
 
 impl Parser<'_> {
-    /// Parses one events segment into `out` (partitioned by event key).
+    /// Parses one events segment into `out` (partitioned by event key) and
+    /// `out_l` (long event IDs).
     #[inline(never)]
-    fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
-        let mut sink = EventSink { parser: self, d, links, bits1, out, ring: [Ev1::default(); LOOKAHEAD], count: 0 };
+    fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, bits_l: u32, out: &mut Scatter<Ev1>, out_l: &mut Scatter<Ev1L>) {
+        let mut sink = EventSink {
+            parser: self,
+            d,
+            links,
+            bits1,
+            bits_l,
+            out,
+            out_l,
+            ring: [Ev1::default(); LOOKAHEAD],
+            count: 0,
+            wide: [Pend::default(); LOOKAHEAD],
+            wide_count: 0,
+        };
         lines::<7, _>(d, seg, &mut sink);
-        let EventSink { ring, count, out, .. } = sink;
+        let EventSink { ring, count, wide, wide_count, out, out_l, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
             EventSink::resolve(links, bits1, ring[i % LOOKAHEAD], out);
+        }
+        for i in wide_count.saturating_sub(LOOKAHEAD)..wide_count {
+            EventSink::resolve_wide(self, links, bits1, bits_l, wide[i % LOOKAHEAD], out, out_l);
         }
     }
 
     /// Parses one clicks segment into `out` (partitioned by person).
     #[inline(never)]
     fn clicks_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
-        let mut sink = ClickSink { parser: self, d, links, bits2, out, ring: [Ck2::default(); LOOKAHEAD], count: 0 };
+        let mut sink = ClickSink {
+            parser: self,
+            d,
+            links,
+            bits2,
+            out,
+            ring: [Ck2::default(); LOOKAHEAD],
+            count: 0,
+            long_ring: [LongCk::default(); LOOKAHEAD],
+            long_count: 0,
+        };
         lines::<4, _>(d, seg, &mut sink);
-        let ClickSink { ring, count, out, .. } = sink;
+        let ClickSink { ring, count, long_ring, long_count, out, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
             ClickSink::resolve(links, bits2, ring[i % LOOKAHEAD], out);
+        }
+        for i in long_count.saturating_sub(LOOKAHEAD)..long_count {
+            ClickSink::resolve_long(self, links, bits2, long_ring[i % LOOKAHEAD], out);
         }
     }
 }
@@ -443,11 +659,13 @@ pub fn run() {
         eprintln!("    {threads} threads, window splitter: {}", if pdep { "pdep" } else { "tzcnt" });
     }
 
-    // Since V5 about one in eight distinct IDs is long (interned): size the
-    // interner's tables for that share of the lines up front.
-    let input_bytes: usize = maps.iter().map(|m| m.bytes().len()).sum();
-    let interner = Interner::new(input_bytes / 40 / 8 + 1024);
+    // Rough line counts size the partitions: ~80 bytes per event line, ~45 per click line.
+    let est_events = event_bytes / 80 + 1;
+    let est_clicks = click_bytes / 45 + 1;
+    let interner = Interner::new();
+    let longs = LongTable::new((est_events + est_clicks) / 16);
     let parser = Parser {
+        dates: fast::WindowDates::new(base, window.end + LATE_MS),
         window_start: window.start,
         window_end: window.end,
         click_start: window.start - REACH_MS,
@@ -455,6 +673,7 @@ pub fn run() {
         products: &products,
         campaigns: &campaigns,
         interner: &interner,
+        longs: &longs,
     };
 
     // ---- 1. Links.
@@ -467,16 +686,14 @@ pub fn run() {
             let d = maps[seg.file].bytes();
             lines::<2, _>(d, seg, &mut FnSink(|fs: &[usize; 2], fe: &[usize; 2]| {
                 if fs[0] != fe[0] && fs[1] != fe[1] {
-                    pairs.push((parser.key(d, fs[0], fe[0], b'u'), parser.key(d, fs[1], fe[1], b'u')));
+                    pairs.push((parser.link_key(d, fs[0], fe[0]), parser.link_key(d, fs[1], fe[1])));
                 }
             }));
         }
         pairs
     });
-    let odd_after_links = interner.view();
-    let link_table = links::build(&pairs, threads, &odd_after_links);
-    // The view holds every interner shard's lock: release it before parsing.
-    drop(odd_after_links);
+    let odd_after_links = interner.snapshot();
+    let link_table = links::build(&pairs, threads, &odd_after_links, &longs);
     drop(pairs);
     lap("links");
 
@@ -513,9 +730,6 @@ pub fn run() {
     }
 
     // ---- 2. Parse events and clicks.
-    // Rough line counts size the partitions: ~80 bytes per event line, ~45 per click line.
-    let est_events = event_bytes / 80 + 1;
-    let est_clicks = click_bytes / 45 + 1;
     // Partition counts balance the scatter's staging lines against the size
     // of each partition's dedup and person tables (see `partition_bits`).
     let bits_override = std::env::var("SESSIONS_BITS").ok().and_then(|v| v.parse::<u32>().ok());
@@ -524,25 +738,31 @@ pub fn run() {
     if verbose {
         eprintln!("    partitions: events {} / persons {}", 1 << bits1, 1 << bits2);
     }
-    let (p1, p2) = (1usize << bits1, 1usize << bits2);
+    // Long event IDs (about 1 in 8) have their own, fewer partitions.
+    let bits_l = bits1.saturating_sub(3).max(4);
+    let (p1, p2, pl) = (1usize << bits1, 1usize << bits2, 1usize << bits_l);
     let work: Vec<&Segment> = event_segments.iter().chain(&click_segments).collect();
     let next = AtomicUsize::new(0);
-    let parsed: Vec<(Scatter<Ev1>, Scatter<Ck2>)> = par_run(threads, |_| {
+    let parsed: Vec<(Scatter<Ev1>, Scatter<Ev1L>, Scatter<Ck2>)> = par_run(threads, |_| {
         let mut evs: Scatter<Ev1> = Scatter::new(p1, est_events / threads + 1);
+        let mut evs_l: Scatter<Ev1L> = Scatter::new(pl, est_events / 8 / threads + 1);
         let mut cks: Scatter<Ck2> = Scatter::new(p2, est_clicks / threads + 1);
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
             let Some(seg) = work.get(at) else { break };
             let d = maps[seg.file].bytes();
             if seg.file < n_ev {
-                parser.events_segment(d, seg, &link_table, bits1, &mut evs);
+                parser.events_segment(d, seg, &link_table, bits1, bits_l, &mut evs, &mut evs_l);
             } else {
                 parser.clicks_segment(d, seg, &link_table, bits2, &mut cks);
             }
+            // Nothing points into the segment any more (records are copies).
+            maps[seg.file].release(seg.start, seg.end);
         }
         evs.finish();
+        evs_l.finish();
         cks.finish();
-        (evs, cks)
+        (evs, evs_l, cks)
     });
     lap("parse");
 
@@ -550,6 +770,7 @@ pub fn run() {
     // An open-addressing table of whole records per partition; then one
     // sequential sweep emits the valid winners and clears the table.
     let next = AtomicUsize::new(0);
+    let next_l = AtomicUsize::new(0);
     let survivors: Vec<Scatter<Ev2>> = par_run(threads, |_| {
         let mut out: Scatter<Ev2> = Scatter::new(p2, est_events / threads + 1);
         // Distinct event IDs of the partition, densely, with an index table
@@ -564,7 +785,7 @@ pub fn run() {
                 break;
             }
             chunks.clear();
-            for (evs, _) in &parsed {
+            for (evs, _, _) in &parsed {
                 evs.chunks(p, &mut chunks);
             }
             let n: usize = chunks.iter().map(|c| c.len()).sum();
@@ -609,18 +830,72 @@ pub fn run() {
             }
             index[..cap].fill(EMPTY);
         }
+        // The same over the long event IDs' partitions.
+        let mut recs: Vec<Ev1L> = Vec::new();
+        let mut chunks: Vec<&[Ev1L]> = Vec::new();
+        loop {
+            let p = next_l.fetch_add(1, Ordering::Relaxed);
+            if p >= pl {
+                break;
+            }
+            chunks.clear();
+            for (_, evs_l, _) in &parsed {
+                evs_l.chunks(p, &mut chunks);
+            }
+            let n: usize = chunks.iter().map(|c| c.len()).sum();
+            if n == 0 {
+                continue;
+            }
+            assert!(n < EMPTY as usize, "partition too large");
+            let cap = (n * 2).next_power_of_two();
+            let tbits = cap.trailing_zeros();
+            let mask = cap - 1;
+            if index.len() < cap {
+                index.resize(cap, EMPTY);
+            }
+            recs.clear();
+            recs.reserve(n);
+            for chunk in &chunks {
+                for rec in chunk.iter() {
+                    let mut h = take(long_hash(rec.hi, rec.lo), bits_l, tbits);
+                    loop {
+                        let i = unsafe { *index.get_unchecked(h) };
+                        if i == EMPTY {
+                            unsafe { *index.get_unchecked_mut(h) = recs.len() as u32 };
+                            recs.push(*rec);
+                            break;
+                        }
+                        let kept = unsafe { recs.get_unchecked_mut(i as usize) };
+                        if kept.hi == rec.hi && kept.lo == rec.lo {
+                            if rec.ingest < kept.ingest {
+                                *kept = *rec;
+                            }
+                            break;
+                        }
+                        h = (h + 1) & mask;
+                    }
+                }
+            }
+            for r in &recs {
+                if r.tp & VALID != 0 {
+                    let ev = Ev2 { pk: r.pk, t: r.tp as u32, price: ((r.tp >> 32) & 0xFF_FFFF) as u32 };
+                    out.push(take(fib(r.pk & PERSON_MASK), 0, bits2), ev);
+                }
+            }
+            index[..cap].fill(EMPTY);
+        }
         out.finish();
         out
     });
     lap("dedup");
 
     // ---- 4. People: largest partitions first.
-    let odd = interner.view();
-    let ctx = person::Ctx { base, first_day, days, campaigns: campaigns.len(), odd: &odd };
+    let odd = interner.snapshot();
+    let ctx = person::Ctx { base, first_day, days, campaigns: campaigns.len(), odd: &odd, longs: &longs };
     let mut order: Vec<(usize, usize)> = (0..p2)
         .map(|q| {
             let n: usize = survivors.iter().map(|s| s.len(q)).sum::<usize>()
-                + parsed.iter().map(|(_, c)| c.len(q)).sum::<usize>();
+                + parsed.iter().map(|(_, _, c)| c.len(q)).sum::<usize>();
             (n, q)
         })
         .collect();
@@ -647,7 +922,7 @@ pub fn run() {
             for s in &survivors {
                 s.chunks(q, &mut evs);
             }
-            for (_, c) in &parsed {
+            for (_, _, c) in &parsed {
                 c.chunks(q, &mut cks);
             }
             person::process(&evs, &cks, bits2, &ctx, &mut scratch, &mut out);

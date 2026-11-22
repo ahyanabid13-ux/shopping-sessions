@@ -215,6 +215,85 @@ fn scan_window_pdep<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; 
     }
 }
 
+/// `scan_window_pdep` for the common shape, from two 64-byte masks instead
+/// of one 128-byte mask: the first is anchored at the line start and must
+/// hold the first N/2 commas; the second is anchored at the field after
+/// them and must hold the newline. Every position then comes from a single
+/// 64-bit word (no per-field choice between two halves). Any other line
+/// (a longer one, an empty first field, an empty field at the second
+/// anchor) is handed to `scan_window_pdep`, and for the lines handled here
+/// the result is the same as that function's.
+#[inline(always)]
+fn scan_window_two<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+    debug_assert!(start + 128 <= data.len());
+    let h = N / 2;
+    unsafe {
+        let p = data.as_ptr().add(start);
+        let (nl_a, cm_a, q_a) = masks64(p);
+        // Commas before the first newline of these 64 bytes (all, if none).
+        let ca = _bzhi_u64(cm_a, nl_a.trailing_zeros());
+        if ca.count_ones() < h as u32 || ca & 1 != 0 {
+            return scan_window_pdep::<N>(data, start, fs, fe);
+        }
+        let mut ends = [0u32; N];
+        let mut rest = ca;
+        for end in ends.iter_mut().take(h) {
+            *end = rest.trailing_zeros();
+            rest &= rest - 1;
+        }
+        // Field h starts at b (1..=64), right after the h-th comma.
+        let b = ends[h - 1] + 1;
+        let fm = _bzhi_u64(ca, b);
+        let (nl_b, cm_b, q_b) = masks64(p.add(b as usize));
+        if nl_b == 0 {
+            return scan_window_pdep::<N>(data, start, fs, fe);
+        }
+        let e = nl_b.trailing_zeros();
+        let cb = _bzhi_u64(cm_b, e);
+        if cb & 1 != 0 {
+            return scan_window_pdep::<N>(data, start, fs, fe);
+        }
+        let end = start + (b + e) as usize;
+        if cb.count_ones() != (N - 1 - h) as u32 {
+            return Window::Line { end, ok: false };
+        }
+        // Wrapped fields, as in `scan_window_pdep`: a quote on the first and
+        // on the last byte of a field of two bytes or more.
+        let qa = _bzhi_u64(q_a, b);
+        let qb = _bzhi_u64(q_b, e);
+        let sa = 1 | (fm ^ (1u64 << (b - 1))) << 1;
+        let la = fm >> 1;
+        let wa = _pext_u64(qa, sa) & _pext_u64(qa, la) & !_pext_u64(sa & la, sa);
+        let sb = 1 | cb << 1;
+        let last = if e == 0 { 0 } else { 1u64 << (e - 1) };
+        let lb = cb >> 1 | last;
+        let wb = _pext_u64(qb, sb) & _pext_u64(qb, lb) & !_pext_u64(sb & lb, sb);
+        let ok = qa.count_ones() + qb.count_ones() == 2 * (wa.count_ones() + wb.count_ones());
+        let mut cur = 0u32;
+        for i in 0..h {
+            let w = ((wa >> i) & 1) as usize;
+            fs[i] = start + cur as usize + w;
+            fe[i] = start + ends[i] as usize - w;
+            cur = ends[i] + 1;
+        }
+        let base = start + b as usize;
+        let mut rest = cb;
+        let mut cur = 0u32;
+        for i in h..N - 1 {
+            let at = rest.trailing_zeros();
+            rest &= rest - 1;
+            let w = ((wb >> (i - h)) & 1) as usize;
+            fs[i] = base + cur as usize + w;
+            fe[i] = base + at as usize - w;
+            cur = at + 1;
+        }
+        let w = ((wb >> (N - 1 - h)) & 1) as usize;
+        fs[N - 1] = base + cur as usize + w;
+        fe[N - 1] = end - w;
+        Window::Line { end, ok }
+    }
+}
+
 /// True when pdep/pext are fast here. They are microcoded (hundreds of
 /// cycles) on AMD family 17h (Zen, Zen+, Zen 2) and on Hygon (family 18h).
 pub fn pdep_is_fast() -> bool {
@@ -245,7 +324,7 @@ pub fn pdep_is_fast() -> bool {
 #[inline(always)]
 pub fn scan_window<const N: usize, const PDEP: bool>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
     if PDEP {
-        scan_window_pdep::<N>(data, start, fs, fe)
+        scan_window_two::<N>(data, start, fs, fe)
     } else {
         scan_window_tz::<N>(data, start, fs, fe)
     }
@@ -304,6 +383,43 @@ pub fn id_key(data: &[u8], s: usize, e: usize, prefix: u8) -> u64 {
         let hi = _mm_cvtsi128_si32(quads) as u32 as u64;
         let lo = _mm_extract_epi32::<1>(quads) as u32 as u64;
         crate::ids::fast_from(digits, hi * 1_679_616 + lo)
+    }
+}
+
+/// (hi, lo) of `data[s..e]` when it is `prefix` + exactly 32 lowercase hex digits [0-9a-f], else None.
+/// hi holds the first 16 digits, first digit most significant, so (hi, lo) numeric order == byte-wise order.
+#[inline(always)]
+pub fn hex_key(data: &[u8], s: usize, e: usize, prefix: u8) -> Option<(u64, u64)> {
+    if e - s != 33 || data[s] != prefix {
+        return None;
+    }
+    unsafe {
+        // data[s + 1..s + 33] is in bounds: e == s + 33 <= data.len().
+        let p = data.as_ptr().add(s + 1);
+        let a = _mm_loadu_si128(p as *const __m128i);
+        let b = _mm_loadu_si128(p.add(16) as *const __m128i);
+        // Signed compares: bytes >= 0x80 are negative and fail both ranges.
+        let dig = |v: __m128i| {
+            _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(b'0' as i8 - 1)), _mm_cmplt_epi8(v, _mm_set1_epi8(b'9' as i8 + 1)))
+        };
+        let alpha = |v: __m128i| {
+            _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(b'a' as i8 - 1)), _mm_cmplt_epi8(v, _mm_set1_epi8(b'f' as i8 + 1)))
+        };
+        let (da, aa, db, ab) = (dig(a), alpha(a), dig(b), alpha(b));
+        let ok = _mm_and_si128(_mm_or_si128(da, aa), _mm_or_si128(db, ab));
+        if _mm_movemask_epi8(ok) != 0xFFFF {
+            return None;
+        }
+        // Nibbles: c - '0', minus 39 more for 'a'..'f'.
+        let zero = _mm_set1_epi8(b'0' as i8);
+        let gap = _mm_set1_epi8(39);
+        let na = _mm_sub_epi8(_mm_sub_epi8(a, zero), _mm_and_si128(aa, gap));
+        let nb = _mm_sub_epi8(_mm_sub_epi8(b, zero), _mm_and_si128(ab, gap));
+        let w = _mm_set1_epi16(0x0110); // bytes (16, 1): the first digit of each pair is the high nibble
+        let bytes = _mm_packus_epi16(_mm_maddubs_epi16(na, w), _mm_maddubs_epi16(nb, w));
+        let hi = (_mm_cvtsi128_si64(bytes) as u64).swap_bytes();
+        let lo = (_mm_extract_epi64::<1>(bytes) as u64).swap_bytes();
+        Some((hi, lo))
     }
 }
 
@@ -401,6 +517,74 @@ fn iso19(data: &[u8], s: usize) -> Option<i64> {
         Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000)
     }
 }
+
+/// Exact calendar-prefix cache. Slots shared by different months are safe:
+/// every hit compares all eleven bytes of "YYYY-MM-DDT".
+pub struct WindowDates([(u64, u32, i64); 32]);
+
+impl WindowDates {
+    pub fn new(from: i64, until: i64) -> Self {
+        let mut table = Self([(0, u32::MAX, 0); 32]);
+        for day in from.div_euclid(ts::DAY)..=until.div_euclid(ts::DAY) {
+            let (y, m, d) = ts::civil_from_days(day);
+            if !(0..=9999).contains(&y) { continue; }
+            let date = format!("{y:04}-{m:02}-{d:02}T");
+            let bytes = date.as_bytes();
+            let prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let suffix = u32::from_le_bytes([bytes[8], bytes[9], b'T', 0]);
+            table.0[d as usize] = (prefix, suffix, day * ts::DAY);
+        }
+        table
+    }
+
+    #[inline(always)]
+    pub fn parse(&self, data: &[u8], start: usize, end: usize) -> Option<i64> {
+        debug_assert!(start <= end && end <= data.len());
+        if end - start != 20 {
+            return timestamp(data, start, end);
+        }
+        // Bytes: 0..8 "YYYY-MM-", 8..10 "DD", 10 'T', 11..19 "HH:MM:SS", 19 'Z'.
+        let (prefix, mid, clock, z) = unsafe {
+            let p = data.as_ptr().add(start);
+            (
+                (p as *const u64).read_unaligned(),
+                (p.add(8) as *const u32).read_unaligned(),
+                (p.add(11) as *const u64).read_unaligned(),
+                *p.add(19),
+            )
+        };
+        if z != b'Z' {
+            return timestamp(data, start, end);
+        }
+        let suffix = mid & 0x00FF_FFFF;
+        let slot = (((suffix & 15) * 10 + ((suffix >> 8) & 15)) & 31) as usize;
+        let (head, tail, midnight) = self.0[slot];
+        if head != prefix || tail != suffix {
+            return iso19(data, start);
+        }
+        // The date is one of the table's (valid) days. The clock: every
+        // digit within its own limit (H1 <= 2, M1 and S1 <= 5, the rest
+        // <= 9) and both colons in place, all bytes at once. A byte over
+        // its limit, or not a digit at all, sets a high bit in `x` or in
+        // the sum (no carry leaves a byte while `x` has no high bit).
+        let x = clock ^ u64::from_le_bytes(*b"00:00:00");
+        const ROOM: u64 = u64::from_le_bytes([0x7F - 2, 0x7F - 9, 0x7F, 0x7F - 5, 0x7F - 9, 0x7F, 0x7F - 5, 0x7F - 9]);
+        if (x | x.wrapping_add(ROOM)) & 0x8080_8080_8080_8080 != 0 {
+            return None;
+        }
+        // Byte k of x * 2561 is 10 * byte(k-1) + byte(k): bytes 1, 4 and 7
+        // are the hour, the minute and the second.
+        let pairs = x.wrapping_mul(2561);
+        let hour = (pairs >> 8) & 0xFF;
+        let minute = (pairs >> 32) & 0xFF;
+        let second = pairs >> 56;
+        if hour > 23 {
+            return None;
+        }
+        Some(midnight + ((hour * 3600 + minute * 60 + second) * 1000) as i64)
+    }
+}
+
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at `data[s..s+20]`; None if it is not exactly that.
 #[inline(always)]
@@ -717,6 +901,65 @@ mod tests {
         }
     }
 
+    /// Lines shaped like real ones (N fields of many lengths, some wrapped,
+    /// some with a stray quote, sometimes a field too many or too few), so
+    /// that commas, quotes and the newline fall on every side of bytes 63/64
+    /// and of the second anchor.
+    #[test]
+    fn window_shapes_match_reference() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let lens = [0usize, 0, 1, 1, 2, 2, 3, 5, 8, 9, 13, 20, 20, 25, 30, 31, 32, 33, 34, 40, 61, 62, 63, 64, 65, 70];
+        let chars = b"abz019 \r";
+        for round in 0..600_000u32 {
+            let n = [7usize, 4, 2][(round % 3) as usize];
+            let fields = match rnd() % 16 {
+                0 => n + 1,
+                1 => n - 1,
+                _ => n,
+            };
+            let mut line: Vec<u8> = Vec::new();
+            for f in 0..fields {
+                if f > 0 {
+                    line.push(b',');
+                }
+                let len = lens[(rnd() % lens.len() as u64) as usize];
+                let wrap = rnd() % 3 == 0;
+                if wrap {
+                    line.push(b'"');
+                }
+                for _ in 0..len {
+                    line.push(chars[(rnd() % chars.len() as u64) as usize]);
+                }
+                if wrap && rnd() % 12 != 0 {
+                    line.push(b'"');
+                }
+                if rnd() % 40 == 0 {
+                    line.push(b'"');
+                }
+            }
+            if rnd() % 50 == 0 && !line.is_empty() {
+                let at = (rnd() % line.len() as u64) as usize;
+                line[at] = b'"';
+            }
+            let mut data = b"header\n".to_vec();
+            data.extend_from_slice(&line);
+            data.push(b'\n');
+            data.extend_from_slice(&[b'z'; 200]);
+            check_window::<7, true>(&data, &line);
+            check_window::<7, false>(&data, &line);
+            check_window::<4, true>(&data, &line);
+            check_window::<4, false>(&data, &line);
+            check_window::<2, true>(&data, &line);
+            check_window::<2, false>(&data, &line);
+        }
+    }
+
     #[test]
     fn ids_match_reference() {
         let samples: Vec<&[u8]> = vec![
@@ -730,6 +973,139 @@ mod tests {
             let end = data.len();
             data.extend_from_slice(b",yyyyyyyy");
             assert_eq!(id_key(&data, start, end, b'e'), crate::ids::fast_key(s, b'e'), "{:?}", s);
+        }
+    }
+
+    fn hex_ref(b: &[u8], prefix: u8) -> Option<(u64, u64)> {
+        if b.len() != 33 || b[0] != prefix {
+            return None;
+        }
+        let mut v: u128 = 0;
+        for &c in &b[1..] {
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => return None,
+            };
+            v = v << 4 | d as u128;
+        }
+        Some(((v >> 64) as u64, v as u64))
+    }
+
+    #[test]
+    fn hex_keys_match_reference() {
+        let mut seed = 0xDEAD_BEEF_u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const HEX: &[u8] = b"0123456789abcdef";
+        let bad: &[u8] = b"AFgG/:`@{\x80\xff \"";
+        let mut samples: Vec<Vec<u8>> = vec![
+            [b"u".as_slice(), &[b'0'; 32]].concat(),
+            [b"u".as_slice(), &[b'f'; 32]].concat(),
+            b"u02423c3d84ab053af78764ce49f23b5c".to_vec(),
+        ];
+        for i in 0..200_000 {
+            let mut s = vec![b'u'];
+            s.extend((0..32).map(|_| HEX[(rnd() % 16) as usize]));
+            match i % 6 {
+                0 => {}
+                1 => {
+                    let at = 1 + (rnd() % 32) as usize;
+                    s[at] = bad[(rnd() % bad.len() as u64) as usize];
+                }
+                2 => {
+                    if rnd() % 2 == 0 {
+                        s.pop();
+                    } else {
+                        s.push(HEX[(rnd() % 16) as usize]);
+                    }
+                }
+                3 => s[0] = b'e',
+                4 => {
+                    let at = 1 + (rnd() % 32) as usize;
+                    s[at] = 0x80 | (rnd() as u8);
+                }
+                _ => {
+                    let at = 1 + (rnd() % 32) as usize;
+                    s[at] = rnd() as u8;
+                }
+            }
+            samples.push(s);
+        }
+        for s in &samples {
+            let mut data = b"xxxxxxxxxxxxxxxx,".to_vec();
+            let start = data.len();
+            data.extend_from_slice(s);
+            let end = data.len();
+            data.extend_from_slice(b",yyyyyyyy");
+            assert_eq!(hex_key(&data, start, end, b'u'), hex_ref(s, b'u'), "{:?}", String::from_utf8_lossy(s));
+            // At the very end of the buffer as well: no over-read.
+            assert_eq!(hex_key(s, 0, s.len(), b'u'), hex_ref(s, b'u'));
+        }
+        assert_eq!(hex_key(&samples[0], 0, 33, b'u'), Some((0, 0)));
+        assert_eq!(hex_key(&samples[1], 0, 33, b'u'), Some((u64::MAX, u64::MAX)));
+    }
+
+    #[test]
+    fn window_date_cache_matches_scalar() {
+        let d = ts::days_from_civil(2028, 2, 29) * ts::DAY;
+        let dates = WindowDates::new(d - ts::DAY * 32, d + ts::DAY * 3);
+        for text in [*b"2028-02-29T23:59:59Z", *b"2028-01-29T10:00:00Z", *b"1899-01-31T00:00:00Z"] {
+            for pos in 0..20 {
+                for byte in 0..=255 {
+                    let mut field = text;
+                    field[pos] = byte;
+                    assert_eq!(dates.parse(&field, 0, 20), ts::parse(&field));
+                }
+            }
+        }
+    }
+
+    /// Random F1-shaped fields on days inside and outside the table, half of
+    /// them damaged in one or two bytes or given an out-of-range clock.
+    #[test]
+    fn window_date_cache_random() {
+        let d = ts::days_from_civil(2028, 2, 20);
+        let dates = WindowDates::new((d - 7) * ts::DAY, (d + 15) * ts::DAY);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let junk = b"0123456789:-TZtz +/.";
+        let mut hits = 0u32;
+        for _ in 0..3_000_000 {
+            let day = d - 40 + (rnd() % 80) as i64;
+            let (y, m, dd) = ts::civil_from_days(day);
+            let (mut hh, mut mi, mut ss) = (rnd() % 24, rnd() % 60, rnd() % 60);
+            match rnd() % 12 {
+                0 => hh = 24 + rnd() % 76,
+                1 => mi = 60 + rnd() % 40,
+                2 => ss = 60 + rnd() % 40,
+                _ => {}
+            }
+            let mut field = format!("{y:04}-{m:02}-{dd:02}T{hh:02}:{mi:02}:{ss:02}Z").into_bytes();
+            assert_eq!(field.len(), 20);
+            if rnd() % 2 == 0 {
+                for _ in 0..1 + rnd() % 2 {
+                    let at = (rnd() % 20) as usize;
+                    field[at] = if rnd() % 8 == 0 { rnd() as u8 } else { junk[(rnd() % junk.len() as u64) as usize] };
+                }
+            }
+            let got = dates.parse(&field, 0, 20);
+            assert_eq!(got, ts::parse(&field), "{:?}", String::from_utf8_lossy(&field));
+            hits += got.is_some() as u32;
+        }
+        assert!(hits > 500_000);
+        // Other lengths go to the general parser.
+        for s in [&b"1791071890000"[..], b"2028-02-20T10:00:00+02:00", b"", b"2028-02-20T10:00:00", b"2028-02-20T10:00:00ZZ"] {
+            assert_eq!(dates.parse(s, 0, s.len()), ts::parse(s));
         }
     }
 
