@@ -291,6 +291,41 @@ fn lines_with<const N: usize, const PDEP: bool, S: LineSink<N>>(d: &[u8], seg: &
     }
 }
 
+/// EXPERIMENT (exact hot-user cache): per-worker direct-mapped cache from a
+/// full user key to its person key, kept across segments. A slot holds
+/// (user key + 1, person); 0 means empty. Full-key compare: a conflict is a
+/// miss, never a wrong answer. Empty slice = disabled (SESSIONS_UCACHE=0).
+pub struct UserCache {
+    slots: Vec<(u64, u64)>,
+    shift: u32,
+}
+
+impl UserCache {
+    fn new(size: usize) -> UserCache {
+        let size = if size == 0 { 0 } else { size.next_power_of_two() };
+        UserCache { slots: vec![(0, 0); size], shift: 64 - size.max(1).trailing_zeros() }
+    }
+    #[inline(always)]
+    fn slot(&self, user: u64) -> usize {
+        (fib(user) >> self.shift) as usize & (self.slots.len().wrapping_sub(1))
+    }
+    #[inline(always)]
+    fn get(&self, user: u64) -> Option<u64> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let e = unsafe { self.slots.get_unchecked(self.slot(user)) };
+        (e.0 == user + 1).then_some(e.1)
+    }
+    #[inline(always)]
+    fn put(&mut self, user: u64, person: u64) {
+        if !self.slots.is_empty() {
+            let i = self.slot(user);
+            unsafe { *self.slots.get_unchecked_mut(i) = (user + 1, person) };
+        }
+    }
+}
+
 /// Per-segment state of the events parse: valid copies wait LOOKAHEAD
 /// records in a ring after their person-table line is prefetched.
 struct EventSink<'p, 'a> {
@@ -301,13 +336,17 @@ struct EventSink<'p, 'a> {
     out: &'p mut Scatter<Ev1>,
     ring: [Ev1; LOOKAHEAD],
     count: usize,
+    cache: &'p mut UserCache,
 }
 
 impl EventSink<'_, '_> {
     #[inline(always)]
-    fn resolve(links: &LinkTable, bits1: u32, rec: Ev1, out: &mut Scatter<Ev1>) {
+    fn resolve(links: &LinkTable, bits1: u32, rec: Ev1, out: &mut Scatter<Ev1>, cache: &mut UserCache) {
         let mut r = rec;
-        r.pk = links.person_of(r.pk & USER_MASK) | (r.pk & !PERSON_MASK);
+        let user = r.pk & USER_MASK;
+        let person = links.person_of(user);
+        cache.put(user, person);
+        r.pk = person | (r.pk & !PERSON_MASK);
         out.push(take(fib(r.key), 0, bits1), r);
     }
 }
@@ -320,10 +359,17 @@ impl LineSink<7> for EventSink<'_, '_> {
             self.out.push(take(fib(rec.key), 0, self.bits1), rec);
             return;
         }
+        if let Some(person) = self.cache.get(rec.pk & USER_MASK) {
+            // Exact hit: emit now (dedup does not depend on record order).
+            let mut r = rec;
+            r.pk = person | (r.pk & !PERSON_MASK);
+            self.out.push(take(fib(r.key), 0, self.bits1), r);
+            return;
+        }
         self.links.prefetch(rec.pk & USER_MASK);
         let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
         if self.count >= LOOKAHEAD {
-            Self::resolve(self.links, self.bits1, *slot, self.out);
+            Self::resolve(self.links, self.bits1, *slot, self.out, self.cache);
         }
         *slot = rec;
         self.count += 1;
@@ -339,13 +385,16 @@ struct ClickSink<'p, 'a> {
     out: &'p mut Scatter<Ck2>,
     ring: [Ck2; LOOKAHEAD],
     count: usize,
+    cache: &'p mut UserCache,
 }
 
 impl ClickSink<'_, '_> {
     #[inline(always)]
-    fn resolve(links: &LinkTable, bits2: u32, c: Ck2, out: &mut Scatter<Ck2>) {
+    fn resolve(links: &LinkTable, bits2: u32, c: Ck2, out: &mut Scatter<Ck2>, cache: &mut UserCache) {
         let mut c = c;
-        c.pk = links.person_of(c.pk);
+        let person = links.person_of(c.pk);
+        cache.put(c.pk, person);
+        c.pk = person;
         out.push(take(fib(c.pk), 0, bits2), c);
     }
 }
@@ -354,10 +403,16 @@ impl LineSink<4> for ClickSink<'_, '_> {
     #[inline(always)]
     fn line(&mut self, fs: &[usize; 4], fe: &[usize; 4]) {
         let Some(c) = self.parser.click(self.d, fs, fe) else { return };
+        if let Some(person) = self.cache.get(c.pk) {
+            let mut c = c;
+            c.pk = person;
+            self.out.push(take(fib(c.pk), 0, self.bits2), c);
+            return;
+        }
         self.links.prefetch(c.pk);
         let slot = unsafe { self.ring.get_unchecked_mut(self.count % LOOKAHEAD) };
         if self.count >= LOOKAHEAD {
-            Self::resolve(self.links, self.bits2, *slot, self.out);
+            Self::resolve(self.links, self.bits2, *slot, self.out, self.cache);
         }
         *slot = c;
         self.count += 1;
@@ -367,23 +422,23 @@ impl LineSink<4> for ClickSink<'_, '_> {
 impl Parser<'_> {
     /// Parses one events segment into `out` (partitioned by event key).
     #[inline(never)]
-    fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
-        let mut sink = EventSink { parser: self, d, links, bits1, out, ring: [Ev1::default(); LOOKAHEAD], count: 0 };
+    fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>, cache: &mut UserCache) {
+        let mut sink = EventSink { parser: self, d, links, bits1, out, ring: [Ev1::default(); LOOKAHEAD], count: 0, cache };
         lines::<7, _>(d, seg, &mut sink);
-        let EventSink { ring, count, out, .. } = sink;
+        let EventSink { ring, count, out, cache, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
-            EventSink::resolve(links, bits1, ring[i % LOOKAHEAD], out);
+            EventSink::resolve(links, bits1, ring[i % LOOKAHEAD], out, cache);
         }
     }
 
     /// Parses one clicks segment into `out` (partitioned by person).
     #[inline(never)]
-    fn clicks_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
-        let mut sink = ClickSink { parser: self, d, links, bits2, out, ring: [Ck2::default(); LOOKAHEAD], count: 0 };
+    fn clicks_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>, cache: &mut UserCache) {
+        let mut sink = ClickSink { parser: self, d, links, bits2, out, ring: [Ck2::default(); LOOKAHEAD], count: 0, cache };
         lines::<4, _>(d, seg, &mut sink);
-        let ClickSink { ring, count, out, .. } = sink;
+        let ClickSink { ring, count, out, cache, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
-            ClickSink::resolve(links, bits2, ring[i % LOOKAHEAD], out);
+            ClickSink::resolve(links, bits2, ring[i % LOOKAHEAD], out, cache);
         }
     }
 }
@@ -522,7 +577,9 @@ pub fn run() {
     let (p1, p2) = (1usize << bits1, 1usize << bits2);
     let work: Vec<&Segment> = event_segments.iter().chain(&click_segments).collect();
     let next = AtomicUsize::new(0);
+    let ucache_size = std::env::var("SESSIONS_UCACHE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
     let parsed: Vec<(Scatter<Ev1>, Scatter<Ck2>)> = par_run(threads, |_| {
+        let mut ucache = UserCache::new(ucache_size);
         let mut evs: Scatter<Ev1> = Scatter::new(p1, est_events / threads + 1);
         let mut cks: Scatter<Ck2> = Scatter::new(p2, est_clicks / threads + 1);
         loop {
@@ -530,9 +587,9 @@ pub fn run() {
             let Some(seg) = work.get(at) else { break };
             let d = maps[seg.file].bytes();
             if seg.file < n_ev {
-                parser.events_segment(d, seg, &link_table, bits1, &mut evs);
+                parser.events_segment(d, seg, &link_table, bits1, &mut evs, &mut ucache);
             } else {
-                parser.clicks_segment(d, seg, &link_table, bits2, &mut cks);
+                parser.clicks_segment(d, seg, &link_table, bits2, &mut cks, &mut ucache);
             }
         }
         evs.finish();
