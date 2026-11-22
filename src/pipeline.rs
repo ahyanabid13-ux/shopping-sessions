@@ -178,6 +178,7 @@ fn first_line(data: &[u8], start: usize) -> usize {
 }
 
 struct Parser<'a> {
+    dates: fast::WindowDates,
     window_start: i64,
     window_end: i64,
     click_start: i64,
@@ -229,7 +230,7 @@ impl Parser<'_> {
             return None;
         }
         // rules.md: ingest_ts is always valid F1. A line without one cannot be ordered.
-        let ingest = fast::timestamp(d, fs[3], fe[3])?;
+        let ingest = self.dates.parse(d, fs[3], fe[3])?;
         let mut rec = Pend { ingest, ..Pend::default() };
         let k = fast::id_key(d, fs[0], fe[0], b'e');
         if k != 0 {
@@ -244,7 +245,7 @@ impl Parser<'_> {
         if fs[1] == fe[1] || fs[5] == fe[5] {
             return Some(rec);
         }
-        let Some(t) = fast::timestamp(d, fs[2], fe[2]) else { return Some(rec) };
+        let Some(t) = self.dates.parse(d, fs[2], fe[2]) else { return Some(rec) };
         if t < self.window_start || t >= self.window_end {
             return Some(rec);
         }
@@ -299,7 +300,7 @@ impl Parser<'_> {
         if fs[0] == fe[0] || fs[1] == fe[1] {
             return None;
         }
-        let t = fast::timestamp(d, fs[3], fe[3])?;
+        let t = self.dates.parse(d, fs[3], fe[3])?;
         if t < self.click_start || t >= self.window_end {
             return None;
         }
@@ -664,6 +665,7 @@ pub fn run() {
     let interner = Interner::new();
     let longs = LongTable::new((est_events + est_clicks) / 16);
     let parser = Parser {
+        dates: fast::WindowDates::new(base, window.end + LATE_MS),
         window_start: window.start,
         window_end: window.end,
         click_start: window.start - REACH_MS,

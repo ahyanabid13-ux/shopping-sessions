@@ -439,6 +439,61 @@ fn iso19(data: &[u8], s: usize) -> Option<i64> {
     }
 }
 
+/// Exact calendar-prefix cache. Slots shared by different months are safe:
+/// every hit compares all eleven bytes of "YYYY-MM-DDT".
+pub struct WindowDates([(u64, u32, i64); 32]);
+
+impl WindowDates {
+    pub fn new(from: i64, until: i64) -> Self {
+        let mut table = Self([(0, u32::MAX, 0); 32]);
+        for day in from.div_euclid(ts::DAY)..=until.div_euclid(ts::DAY) {
+            let (y, m, d) = ts::civil_from_days(day);
+            if !(0..=9999).contains(&y) { continue; }
+            let date = format!("{y:04}-{m:02}-{d:02}T");
+            let bytes = date.as_bytes();
+            let prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let suffix = u32::from_le_bytes([bytes[8], bytes[9], b'T', 0]);
+            table.0[d as usize] = (prefix, suffix, day * ts::DAY);
+        }
+        table
+    }
+
+    #[inline(always)]
+    pub fn parse(&self, data: &[u8], start: usize, end: usize) -> Option<i64> {
+        let field = &data[start..end];
+        if field.len() != 20 || field[19] != b'Z' { return timestamp(data, start, end); }
+        let prefix = u64::from_le_bytes(field[..8].try_into().unwrap());
+        let suffix = u32::from_le_bytes([field[8], field[9], field[10], 0]);
+        let slot = (((suffix & 15) * 10 + ((suffix >> 8) & 15)) & 31) as usize;
+        let (head, tail, midnight) = self.0[slot];
+        if head != prefix || tail != suffix { return iso19(data, start); }
+        let clock = u64::from_le_bytes(field[11..19].try_into().unwrap());
+        if clock & !0x0f0f_000f_0f00_0f0f != u64::from_le_bytes(*b"00:00:00") {
+            return None;
+        }
+        let pair = |shift: u32| {
+            let v = (clock >> shift) as usize;
+            ((v & 15) << 4) | ((v >> 8) & 15)
+        };
+        let ms = HOURS[pair(0)] + MINUTES[pair(24)] + SECONDS[pair(48)];
+        (ms >= 0).then_some(midnight + ms as i64)
+    }
+}
+
+// An invalid pair remains negative even after the two largest valid contributions.
+const fn clock_table(limit: usize, scale: i32) -> [i32; 256] {
+    let mut table = [-100_000_000; 256];
+    let mut n = 0;
+    while n <= limit {
+        table[(n / 10) * 16 + n % 10] = n as i32 * scale;
+        n += 1;
+    }
+    table
+}
+static HOURS: [i32; 256] = clock_table(23, 3_600_000);
+static MINUTES: [i32; 256] = clock_table(59, 60_000);
+static SECONDS: [i32; 256] = clock_table(59, 1000);
+
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at `data[s..s+20]`; None if it is not exactly that.
 #[inline(always)]
 pub fn f1(data: &[u8], s: usize) -> Option<i64> {
@@ -842,6 +897,21 @@ mod tests {
         }
         assert_eq!(hex_key(&samples[0], 0, 33, b'u'), Some((0, 0)));
         assert_eq!(hex_key(&samples[1], 0, 33, b'u'), Some((u64::MAX, u64::MAX)));
+    }
+
+    #[test]
+    fn window_date_cache_matches_scalar() {
+        let d = ts::days_from_civil(2028, 2, 29) * ts::DAY;
+        let dates = WindowDates::new(d - ts::DAY * 32, d + ts::DAY * 3);
+        for text in [*b"2028-02-29T23:59:59Z", *b"2028-01-29T10:00:00Z", *b"1899-01-31T00:00:00Z"] {
+            for pos in 0..20 {
+                for byte in 0..=255 {
+                    let mut field = text;
+                    field[pos] = byte;
+                    assert_eq!(dates.parse(&field, 0, 20), ts::parse(&field));
+                }
+            }
+        }
     }
 
     #[test]
