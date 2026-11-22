@@ -18,8 +18,8 @@ pub struct Ev2 {
 }
 
 /// A valid click: person key, click key (for ties), time since `base`,
-/// campaign index (1..). Padded to 32 bytes for the scatter's cache-line
-/// staging.
+/// campaign index (1..). Compact 24-byte representation to reduce
+/// scatter and person-stage memory traffic.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Ck2 {
@@ -27,8 +27,10 @@ pub struct Ck2 {
     pub key: u64,
     pub t: u32,
     pub campaign: u32,
-    pub _pad: u64,
 }
+
+// Scatter stages 24-byte records in groups of eight (three cache lines).
+const _: [(); 24] = [(); std::mem::size_of::<Ck2>()];
 
 pub const NO_CATEGORY: u16 = u16::MAX;
 pub const GAP_MS: u32 = 1_800_000;
