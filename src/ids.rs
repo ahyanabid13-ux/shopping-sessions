@@ -10,6 +10,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub const ODD: u64 = 1 << 42;
@@ -74,36 +75,102 @@ pub fn fast_key(b: &[u8], prefix: u8) -> u64 {
 }
 
 /// Thread-safe store of the "odd" ID strings. Rare by construction.
+/// Interns IDs that are not "fast" keys (since scorer V5, one in eight
+/// distinct IDs carries a 32-character hex suffix, so this is a hot path).
+///
+/// 64 shards, each its own lock, chosen by a fast hash: parse threads rarely
+/// contend. Keys come from one atomic counter, so they are unique and dense
+/// and `snapshot()` keeps its flat layout (index = key without ODD). One heap
+/// allocation per distinct string.
 pub struct Interner {
-    inner: Mutex<InternerInner>,
+    shards: Vec<Mutex<HashMap<Box<[u8]>, u64, FastBuild>>>,
+    next: AtomicU64,
 }
 
-struct InternerInner {
-    index: HashMap<Vec<u8>, u64>,
-    strings: Vec<Vec<u8>>,
+const SHARDS: usize = 64;
+
+/// A fast, non-cryptographic hash (multiply-rotate over 8-byte words). The
+/// inputs are IDs from the dataset; there is no adversarial-hashing concern.
+#[derive(Default, Clone, Copy)]
+pub struct FastBuild;
+
+pub struct FastHasher(u64);
+
+impl std::hash::BuildHasher for FastBuild {
+    type Hasher = FastHasher;
+    #[inline]
+    fn build_hasher(&self) -> FastHasher {
+        FastHasher(0)
+    }
+}
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // Final avalanche so the low bits (hashbrown's buckets) are mixed.
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+        }
+        let rest = chunks.remainder();
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(tail) ^ (bytes.len() as u64) << 56).wrapping_mul(K);
+        self.0 = h;
+    }
+}
+
+#[inline]
+fn hash_bytes(b: &[u8]) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = FastBuild.build_hasher();
+    b.hash(&mut h);
+    h.finish()
 }
 
 impl Interner {
     pub fn new() -> Self {
-        Interner { inner: Mutex::new(InternerInner { index: HashMap::new(), strings: Vec::new() }) }
+        Interner {
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::with_hasher(FastBuild))).collect(),
+            next: AtomicU64::new(0),
+        }
     }
 
-    /// The odd key of `b` (bit 46 set).
+    /// The odd key of `b` (bit 42 set).
     pub fn intern(&self, b: &[u8]) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(&id) = inner.index.get(b) {
+        let shard = (hash_bytes(b) >> 58) as usize % SHARDS;
+        let mut map = self.shards[shard].lock().unwrap();
+        if let Some(&id) = map.get(b) {
             return ODD | id;
         }
-        let id = inner.strings.len() as u64;
+        let id = self.next.fetch_add(1, AtomicOrdering::Relaxed);
         assert!(id < ODD, "too many distinct odd IDs");
-        inner.strings.push(b.to_vec());
-        inner.index.insert(b.to_vec(), id);
+        map.insert(b.into(), id);
         ODD | id
     }
 
     /// A frozen copy of every odd string, indexed by odd key.
     pub fn snapshot(&self) -> Vec<Vec<u8>> {
-        self.inner.lock().unwrap().strings.clone()
+        // Lock every shard first so the counter and the maps agree.
+        let guards: Vec<_> = self.shards.iter().map(|m| m.lock().unwrap()).collect();
+        let n = self.next.load(AtomicOrdering::Relaxed) as usize;
+        let mut out = vec![Vec::new(); n];
+        for g in &guards {
+            for (bytes, &id) in g.iter() {
+                out[id as usize] = bytes.to_vec();
+            }
+        }
+        out
     }
 }
 
@@ -179,11 +246,29 @@ pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &[Vec<u8>]) -> Ordering {
         let pb = vb * POW36[8 - lb];
         return pa.cmp(&pb).then(la.cmp(&lb));
     }
-    let mut sa = Vec::with_capacity(16);
-    let mut sb = Vec::with_capacity(16);
-    write_id(&mut sa, a, prefix, odd);
-    write_id(&mut sb, b, prefix, odd);
-    sa.cmp(&sb)
+    // At least one odd key: compare the bytes, without allocating (this is
+    // hot in link naming since V5's long IDs). A fast key is at most 9 bytes.
+    let mut ba = [0u8; 9];
+    let mut bb = [0u8; 9];
+    let sa = id_bytes(a, prefix, odd, &mut ba);
+    let sb = id_bytes(b, prefix, odd, &mut bb);
+    sa.cmp(sb)
+}
+
+/// The bytes of a fast or odd key; fast keys are spelled into `buf`.
+#[inline]
+fn id_bytes<'a>(key: u64, prefix: u8, odd: &'a [Vec<u8>], buf: &'a mut [u8; 9]) -> &'a [u8] {
+    if key & ODD != 0 {
+        return &odd[(key & !ODD) as usize];
+    }
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let (len, mut value) = fast_parts(key);
+    buf[0] = prefix;
+    for slot in buf[1..=len].iter_mut().rev() {
+        *slot = DIGITS[(value % 36) as usize];
+        value /= 36;
+    }
+    &buf[..=len]
 }
 
 #[cfg(test)]
