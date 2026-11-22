@@ -252,18 +252,29 @@ impl<const N: usize, F: FnMut(&[usize; N], &[usize; N])> LineSink<N> for FnSink<
 /// Calls `sink.line(fs, fe)` for every well-formed line with N fields.
 #[inline(always)]
 fn lines<const N: usize, S: LineSink<N>>(d: &[u8], seg: &Segment, sink: &mut S) {
+    lines_w::<N, S, false>(d, seg, sink)
+}
+
+/// `lines` with the mask builder chosen by `W` (see `fast::masks128`).
+/// `W = true` only inside functions compiled with avx512bw.
+#[inline(always)]
+fn lines_w<const N: usize, S: LineSink<N>, const W: bool>(d: &[u8], seg: &Segment, sink: &mut S) {
     if PDEP_FAST.load(Ordering::Relaxed) {
-        lines_with::<N, true, S>(d, seg, sink)
+        lines_with::<N, true, S, W>(d, seg, sink)
     } else {
-        lines_with::<N, false, S>(d, seg, sink)
+        lines_with::<N, false, S, false>(d, seg, sink)
     }
 }
+
+/// Whether the parse loops use the AVX-512BW mask builder (CPU check at
+/// startup; `SESSIONS_AVX512=0` forces AVX2 for A/B runs).
+static AVX512: AtomicBool = AtomicBool::new(false);
 
 /// Whether the window splitter may use pdep/pext (see `fast::pdep_is_fast`).
 static PDEP_FAST: AtomicBool = AtomicBool::new(true);
 
 #[inline(always)]
-fn lines_with<const N: usize, const PDEP: bool, S: LineSink<N>>(d: &[u8], seg: &Segment, sink: &mut S) {
+fn lines_with<const N: usize, const PDEP: bool, S: LineSink<N>, const W: bool>(d: &[u8], seg: &Segment, sink: &mut S) {
     let len = d.len();
     let mut pos = first_line(d, seg.start);
     let fast_end = seg.end.min(len.saturating_sub(128));
@@ -277,7 +288,7 @@ fn lines_with<const N: usize, const PDEP: bool, S: LineSink<N>>(d: &[u8], seg: &
             std::arch::x86_64::_mm_prefetch(ahead, std::arch::x86_64::_MM_HINT_T0);
             std::arch::x86_64::_mm_prefetch(ahead.wrapping_add(64), std::arch::x86_64::_MM_HINT_T0);
         }
-        let (end, ok) = match if pos < fast_end { fast::scan_window::<N, PDEP>(d, pos, &mut fs, &mut fe) } else { fast::Window::Long } {
+        let (end, ok) = match if pos < fast_end { fast::scan_window::<N, PDEP, W>(d, pos, &mut fs, &mut fe) } else { fast::Window::Long } {
             fast::Window::Line { end, ok } => (end, ok),
             fast::Window::Long => {
                 let (end, n, quotes) = fast::scan::<N>(d, pos, &mut fs, &mut fe);
@@ -368,8 +379,22 @@ impl Parser<'_> {
     /// Parses one events segment into `out` (partitioned by event key).
     #[inline(never)]
     fn events_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
+        if AVX512.load(Ordering::Relaxed) {
+            unsafe { self.events_segment_avx512(d, seg, links, bits1, out) }
+        } else {
+            self.events_segment_with::<false>(d, seg, links, bits1, out)
+        }
+    }
+
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn events_segment_avx512(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
+        self.events_segment_with::<true>(d, seg, links, bits1, out)
+    }
+
+    #[inline(always)]
+    fn events_segment_with<const W: bool>(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits1: u32, out: &mut Scatter<Ev1>) {
         let mut sink = EventSink { parser: self, d, links, bits1, out, ring: [Ev1::default(); LOOKAHEAD], count: 0 };
-        lines::<7, _>(d, seg, &mut sink);
+        lines_w::<7, _, W>(d, seg, &mut sink);
         let EventSink { ring, count, out, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
             EventSink::resolve(links, bits1, ring[i % LOOKAHEAD], out);
@@ -379,8 +404,22 @@ impl Parser<'_> {
     /// Parses one clicks segment into `out` (partitioned by person).
     #[inline(never)]
     fn clicks_segment(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
+        if AVX512.load(Ordering::Relaxed) {
+            unsafe { self.clicks_segment_avx512(d, seg, links, bits2, out) }
+        } else {
+            self.clicks_segment_with::<false>(d, seg, links, bits2, out)
+        }
+    }
+
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn clicks_segment_avx512(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
+        self.clicks_segment_with::<true>(d, seg, links, bits2, out)
+    }
+
+    #[inline(always)]
+    fn clicks_segment_with<const W: bool>(&self, d: &[u8], seg: &Segment, links: &LinkTable, bits2: u32, out: &mut Scatter<Ck2>) {
         let mut sink = ClickSink { parser: self, d, links, bits2, out, ring: [Ck2::default(); LOOKAHEAD], count: 0 };
-        lines::<4, _>(d, seg, &mut sink);
+        lines_w::<4, _, W>(d, seg, &mut sink);
         let ClickSink { ring, count, out, .. } = sink;
         for i in count.saturating_sub(LOOKAHEAD)..count {
             ClickSink::resolve(links, bits2, ring[i % LOOKAHEAD], out);
@@ -415,6 +454,8 @@ pub fn run() {
     let threads = thread_count();
     let pdep = std::env::var("SESSIONS_PDEP").map_or_else(|_| fast::pdep_is_fast(), |v| v != "0");
     PDEP_FAST.store(pdep, Ordering::Relaxed);
+    let avx512 = std::env::var("SESSIONS_AVX512").map_or_else(|_| fast::avx512_usable(), |v| v != "0" && fast::avx512_usable());
+    AVX512.store(avx512 && pdep, Ordering::Relaxed);
 
     let window = lookup::read_manifest(&data.join("manifest.json"));
     let products = Products::read(&data.join("products.csv"));
@@ -440,7 +481,7 @@ pub fn run() {
     let link_segments = segments(&maps, n_ev + n_ck, n_ln);
     lap("setup");
     if verbose {
-        eprintln!("    {threads} threads, window splitter: {}", if pdep { "pdep" } else { "tzcnt" });
+        eprintln!("    {threads} threads, window splitter: {}, masks: {}", if pdep { "pdep" } else { "tzcnt" }, if AVX512.load(Ordering::Relaxed) { "avx512bw" } else { "avx2" });
     }
 
     let interner = Interner::new();

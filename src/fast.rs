@@ -84,6 +84,44 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (m(a, newline) | m(b, newline) << 32, m(a, comma) | m(b, comma) << 32, m(a, quote) | m(b, quote) << 32)
 }
 
+/// Newline, comma and quote masks of the 128 bytes at `p`, as (lo, hi) halves.
+/// `W` selects AVX-512BW (two 64-byte compares straight into mask registers)
+/// instead of AVX2; both give exactly the same bits. `W` is only ever true
+/// inside a function compiled with avx512bw, after a runtime CPU check.
+#[inline(always)]
+unsafe fn masks128<const W: bool>(p: *const u8) -> (u64, u64, u64, u64, u64, u64) {
+    if W {
+        masks128_avx512(p)
+    } else {
+        let (nl0, cm0, q0) = masks64(p);
+        let (nl1, cm1, q1) = masks64(p.add(64));
+        (nl0, cm0, q0, nl1, cm1, q1)
+    }
+}
+
+#[target_feature(enable = "avx512bw")]
+#[inline]
+unsafe fn masks128_avx512(p: *const u8) -> (u64, u64, u64, u64, u64, u64) {
+    let a = _mm512_loadu_si512(p as *const _);
+    let b = _mm512_loadu_si512(p.add(64) as *const _);
+    let newline = _mm512_set1_epi8(b'\n' as i8);
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let quote = _mm512_set1_epi8(b'"' as i8);
+    (
+        _mm512_cmpeq_epi8_mask(a, newline),
+        _mm512_cmpeq_epi8_mask(a, comma),
+        _mm512_cmpeq_epi8_mask(a, quote),
+        _mm512_cmpeq_epi8_mask(b, newline),
+        _mm512_cmpeq_epi8_mask(b, comma),
+        _mm512_cmpeq_epi8_mask(b, quote),
+    )
+}
+
+/// True when the AVX-512BW mask builder may be used (CPU and OS support).
+pub fn avx512_usable() -> bool {
+    std::arch::is_x86_feature_detected!("avx512bw")
+}
+
 /// Outcome of `scan_window`.
 pub enum Window {
     /// The line ends at `end` (its `\n`); `ok` when it has exactly N fields
@@ -168,12 +206,11 @@ fn pext2(x0: u64, x1: u64, m0: u64, m1: u64) -> u64 {
 /// A line whose first field is empty reports `ok == false`: such a line is
 /// dropped by every caller (empty event_id, click_id or link side).
 #[inline(always)]
-fn scan_window_pdep<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+fn scan_window_pdep<const N: usize, const W: bool>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
     debug_assert!(start + 128 <= data.len());
     unsafe {
         let p = data.as_ptr().add(start);
-        let (nl0, cm0, q0) = masks64(p);
-        let (nl1, cm1, q1) = masks64(p.add(64));
+        let (nl0, cm0, q0, nl1, cm1, q1) = masks128::<W>(p);
         if nl0 | nl1 == 0 {
             return Window::Long;
         }
@@ -243,9 +280,9 @@ pub fn pdep_is_fast() -> bool {
 /// the pdep/pext form when `PDEP` and the tzcnt form otherwise. Both give
 /// the same result for every input.
 #[inline(always)]
-pub fn scan_window<const N: usize, const PDEP: bool>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+pub fn scan_window<const N: usize, const PDEP: bool, const W: bool>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
     if PDEP {
-        scan_window_pdep::<N>(data, start, fs, fe)
+        scan_window_pdep::<N, W>(data, start, fs, fe)
     } else {
         scan_window_tz::<N>(data, start, fs, fe)
     }
@@ -617,6 +654,50 @@ pub fn timestamp(data: &[u8], s: usize, e: usize) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// AVX-512 masks and splits are bit-identical to AVX2. Skipped (passes
+    /// vacuously, with a note) on CPUs without avx512bw; run on the scorer.
+    #[test]
+    fn avx512_matches_avx2() {
+        if !avx512_usable() {
+            eprintln!("avx512_matches_avx2: no avx512bw here, skipped");
+            return;
+        }
+        let mut seed = 0xa5a5_1234u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = b"ab,\"\r 9,,\"x\nyz0123\"\",";
+        for _ in 0..200_000 {
+            let buf: Vec<u8> = (0..128).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]).collect();
+            unsafe {
+                assert_eq!(masks128::<true>(buf.as_ptr()), masks128::<false>(buf.as_ptr()));
+            }
+        }
+        for _ in 0..300_000 {
+            let len = (rnd() % 140) as usize;
+            let mut data = b"header\n".to_vec();
+            data.extend((0..len).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]));
+            data.push(b'\n');
+            data.extend_from_slice(&[b'z'; 200]);
+            let (mut fa, mut ea, mut fb, mut eb) = ([0usize; 7], [0usize; 7], [0usize; 7], [0usize; 7]);
+            let a = scan_window::<7, true, true>(&data, 7, &mut fa, &mut ea);
+            let b = scan_window::<7, true, false>(&data, 7, &mut fb, &mut eb);
+            match (a, b) {
+                (Window::Long, Window::Long) => {}
+                (Window::Line { end: x, ok: p }, Window::Line { end: y, ok: q }) => {
+                    assert_eq!((x, p), (y, q));
+                    if p {
+                        assert_eq!((fa, ea), (fb, eb));
+                    }
+                }
+                _ => panic!("window kind differs"),
+            }
+        }
+    }
+
     fn scan_ref<const N: usize>(line: &[u8]) -> Option<Vec<Vec<u8>>> {
         crate::csv::split::<N>(line).map(|f| f.iter().map(|x| x.to_vec()).collect())
     }
@@ -702,7 +783,7 @@ mod tests {
     fn check_window<const N: usize, const PDEP: bool>(data: &[u8], line: &[u8]) {
         let mut fs = [0usize; N];
         let mut fe = [0usize; N];
-        match scan_window::<N, PDEP>(data, 7, &mut fs, &mut fe) {
+        match scan_window::<N, PDEP, false>(data, 7, &mut fs, &mut fe) {
             Window::Long => assert!(line.len() >= 128),
             Window::Line { end, ok } => {
                 assert!(line.len() < 128);
