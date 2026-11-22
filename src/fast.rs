@@ -224,16 +224,16 @@ fn scan_window_pdep<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; 
 /// anchor) is handed to `scan_window_pdep`, and for the lines handled here
 /// the result is the same as that function's.
 #[inline(always)]
-fn scan_window_two<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+fn scan_window_anchored<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N], h: usize) -> Option<Window> {
     debug_assert!(start + 128 <= data.len());
-    let h = N / 2;
+    debug_assert!(h >= 1 && h < N);
     unsafe {
         let p = data.as_ptr().add(start);
         let (nl_a, cm_a, q_a) = masks64(p);
         // Commas before the first newline of these 64 bytes (all, if none).
         let ca = _bzhi_u64(cm_a, nl_a.trailing_zeros());
         if ca.count_ones() < h as u32 || ca & 1 != 0 {
-            return scan_window_pdep::<N>(data, start, fs, fe);
+            return None;
         }
         let mut ends = [0u32; N];
         let mut rest = ca;
@@ -246,16 +246,16 @@ fn scan_window_two<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N
         let fm = _bzhi_u64(ca, b);
         let (nl_b, cm_b, q_b) = masks64(p.add(b as usize));
         if nl_b == 0 {
-            return scan_window_pdep::<N>(data, start, fs, fe);
+            return None;
         }
         let e = nl_b.trailing_zeros();
         let cb = _bzhi_u64(cm_b, e);
         if cb & 1 != 0 {
-            return scan_window_pdep::<N>(data, start, fs, fe);
+            return None;
         }
         let end = start + (b + e) as usize;
         if cb.count_ones() != (N - 1 - h) as u32 {
-            return Window::Line { end, ok: false };
+            return Some(Window::Line { end, ok: false });
         }
         // Wrapped fields, as in `scan_window_pdep`: a quote on the first and
         // on the last byte of a field of two bytes or more.
@@ -290,8 +290,25 @@ fn scan_window_two<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N
         let w = ((wb >> (N - 1 - h)) & 1) as usize;
         fs[N - 1] = base + cur as usize + w;
         fe[N - 1] = end - w;
-        Window::Line { end, ok }
+        Some(Window::Line { end, ok })
     }
+}
+
+/// `scan_window_anchored` with the second anchor after half of the fields;
+/// an event line whose first three fields do not fit in 64 bytes (a long
+/// ID) is tried again with the anchor after two. What neither handles goes
+/// to `scan_window_pdep`.
+#[inline(always)]
+fn scan_window_two<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+    if let Some(w) = scan_window_anchored::<N>(data, start, fs, fe, N / 2) {
+        return w;
+    }
+    if N == 7 {
+        if let Some(w) = scan_window_anchored::<N>(data, start, fs, fe, 2) {
+            return w;
+        }
+    }
+    scan_window_pdep::<N>(data, start, fs, fe)
 }
 
 /// True when pdep/pext are fast here. They are microcoded (hundreds of
