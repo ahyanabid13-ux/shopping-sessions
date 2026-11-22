@@ -24,9 +24,25 @@ use crate::util::{fib, par_run, take, thread_count, Mmap};
 
 const LATE_MS: i64 = 86_400_000;
 const MAX_PRICE: u64 = 10_000_000;
-const SEGMENT: usize = 2 << 20;
+const SEGMENT: usize = build_knob(option_env!("SESSIONS_SEGMENT"), 2 << 20);
 /// User keys use the low 47 bits of a pending record's `pk`.
 const USER_MASK: u64 = (1 << ids::KEY_BITS) - 1;
+
+/// A tuning constant, overridable at build time only (for A/B builds on the
+/// scorer); unset means the default, so normal builds are unaffected.
+const fn build_knob(v: Option<&str>, default: usize) -> usize {
+    let Some(v) = v else { return default };
+    let b = v.as_bytes();
+    let mut n = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        assert!(b[i].is_ascii_digit(), "build knob must be digits");
+        n = n * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    assert!(n > 0, "build knob must be positive");
+    n
+}
 
 /// An event copy as parsed, before dedup.
 #[derive(Clone, Copy, Default)]
@@ -327,9 +343,9 @@ fn partition_bits(rows: usize) -> u32 {
 }
 
 /// How many parsed records later a prefetched person-table line is read.
-const LOOKAHEAD: usize = 16;
+const LOOKAHEAD: usize = build_knob(option_env!("SESSIONS_LOOKAHEAD"), 16);
 /// How far ahead of the line being split its bytes are prefetched.
-const PREFETCH_AHEAD: usize = 2048;
+const PREFETCH_AHEAD: usize = build_knob(option_env!("SESSIONS_PREFETCH_AHEAD"), 2048);
 
 /// Receives every well-formed line of a segment. A trait method marked
 /// `inline(always)` (unlike a closure, which stable Rust cannot mark) keeps
@@ -936,4 +952,22 @@ pub fn run() {
     // returns its errors). Exit now: dropping gigabytes of buffers one by one
     // only delays the exit the scorer is timing; the kernel frees them anyway.
     crate::util::exit_now();
+}
+
+#[cfg(test)]
+mod knob_tests {
+    #[test]
+    fn defaults_when_unset() {
+        if option_env!("SESSIONS_SEGMENT").is_none() {
+            assert_eq!(super::SEGMENT, 2 << 20);
+        }
+        if option_env!("SESSIONS_LOOKAHEAD").is_none() {
+            assert_eq!(super::LOOKAHEAD, 16);
+        }
+        if option_env!("SESSIONS_PREFETCH_AHEAD").is_none() {
+            assert_eq!(super::PREFETCH_AHEAD, 2048);
+        }
+        assert_eq!(super::build_knob(Some("4096"), 1), 4096);
+        assert_eq!(super::build_knob(None, 7), 7);
+    }
 }
