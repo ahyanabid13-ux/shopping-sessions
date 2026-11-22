@@ -196,7 +196,7 @@ impl Parser<'_> {
         }
         let key = self.key(d, fs[0], fe[0], b'k');
         let user = self.key(d, fs[1], fe[1], b'u');
-        Some(Ck2 { pk: user, key, t: (t - self.base) as u32, campaign: c, _pad: 0 })
+        Some(Ck2 { pk: user, key, t: (t - self.base) as u32, campaign: c })
     }
 }
 
