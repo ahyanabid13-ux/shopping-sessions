@@ -215,6 +215,85 @@ fn scan_window_pdep<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; 
     }
 }
 
+/// `scan_window_pdep` for the common shape, from two 64-byte masks instead
+/// of one 128-byte mask: the first is anchored at the line start and must
+/// hold the first N/2 commas; the second is anchored at the field after
+/// them and must hold the newline. Every position then comes from a single
+/// 64-bit word (no per-field choice between two halves). Any other line
+/// (a longer one, an empty first field, an empty field at the second
+/// anchor) is handed to `scan_window_pdep`, and for the lines handled here
+/// the result is the same as that function's.
+#[inline(always)]
+fn scan_window_two<const N: usize>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
+    debug_assert!(start + 128 <= data.len());
+    let h = N / 2;
+    unsafe {
+        let p = data.as_ptr().add(start);
+        let (nl_a, cm_a, q_a) = masks64(p);
+        // Commas before the first newline of these 64 bytes (all, if none).
+        let ca = _bzhi_u64(cm_a, nl_a.trailing_zeros());
+        if ca.count_ones() < h as u32 || ca & 1 != 0 {
+            return scan_window_pdep::<N>(data, start, fs, fe);
+        }
+        let mut ends = [0u32; N];
+        let mut rest = ca;
+        for end in ends.iter_mut().take(h) {
+            *end = rest.trailing_zeros();
+            rest &= rest - 1;
+        }
+        // Field h starts at b (1..=64), right after the h-th comma.
+        let b = ends[h - 1] + 1;
+        let fm = _bzhi_u64(ca, b);
+        let (nl_b, cm_b, q_b) = masks64(p.add(b as usize));
+        if nl_b == 0 {
+            return scan_window_pdep::<N>(data, start, fs, fe);
+        }
+        let e = nl_b.trailing_zeros();
+        let cb = _bzhi_u64(cm_b, e);
+        if cb & 1 != 0 {
+            return scan_window_pdep::<N>(data, start, fs, fe);
+        }
+        let end = start + (b + e) as usize;
+        if cb.count_ones() != (N - 1 - h) as u32 {
+            return Window::Line { end, ok: false };
+        }
+        // Wrapped fields, as in `scan_window_pdep`: a quote on the first and
+        // on the last byte of a field of two bytes or more.
+        let qa = _bzhi_u64(q_a, b);
+        let qb = _bzhi_u64(q_b, e);
+        let sa = 1 | (fm ^ (1u64 << (b - 1))) << 1;
+        let la = fm >> 1;
+        let wa = _pext_u64(qa, sa) & _pext_u64(qa, la) & !_pext_u64(sa & la, sa);
+        let sb = 1 | cb << 1;
+        let last = if e == 0 { 0 } else { 1u64 << (e - 1) };
+        let lb = cb >> 1 | last;
+        let wb = _pext_u64(qb, sb) & _pext_u64(qb, lb) & !_pext_u64(sb & lb, sb);
+        let ok = qa.count_ones() + qb.count_ones() == 2 * (wa.count_ones() + wb.count_ones());
+        let mut cur = 0u32;
+        for i in 0..h {
+            let w = ((wa >> i) & 1) as usize;
+            fs[i] = start + cur as usize + w;
+            fe[i] = start + ends[i] as usize - w;
+            cur = ends[i] + 1;
+        }
+        let base = start + b as usize;
+        let mut rest = cb;
+        let mut cur = 0u32;
+        for i in h..N - 1 {
+            let at = rest.trailing_zeros();
+            rest &= rest - 1;
+            let w = ((wb >> (i - h)) & 1) as usize;
+            fs[i] = base + cur as usize + w;
+            fe[i] = base + at as usize - w;
+            cur = at + 1;
+        }
+        let w = ((wb >> (N - 1 - h)) & 1) as usize;
+        fs[N - 1] = base + cur as usize + w;
+        fe[N - 1] = end - w;
+        Window::Line { end, ok }
+    }
+}
+
 /// True when pdep/pext are fast here. They are microcoded (hundreds of
 /// cycles) on AMD family 17h (Zen, Zen+, Zen 2) and on Hygon (family 18h).
 pub fn pdep_is_fast() -> bool {
@@ -245,7 +324,7 @@ pub fn pdep_is_fast() -> bool {
 #[inline(always)]
 pub fn scan_window<const N: usize, const PDEP: bool>(data: &[u8], start: usize, fs: &mut [usize; N], fe: &mut [usize; N]) -> Window {
     if PDEP {
-        scan_window_pdep::<N>(data, start, fs, fe)
+        scan_window_two::<N>(data, start, fs, fe)
     } else {
         scan_window_tz::<N>(data, start, fs, fe)
     }
@@ -806,6 +885,65 @@ mod tests {
                 let want = scan_ref::<N>(line).filter(|f| !f[0].is_empty());
                 assert_eq!(got, want, "N={N} pdep={PDEP} {:?}", String::from_utf8_lossy(line));
             }
+        }
+    }
+
+    /// Lines shaped like real ones (N fields of many lengths, some wrapped,
+    /// some with a stray quote, sometimes a field too many or too few), so
+    /// that commas, quotes and the newline fall on every side of bytes 63/64
+    /// and of the second anchor.
+    #[test]
+    fn window_shapes_match_reference() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let lens = [0usize, 0, 1, 1, 2, 2, 3, 5, 8, 9, 13, 20, 20, 25, 30, 31, 32, 33, 34, 40, 61, 62, 63, 64, 65, 70];
+        let chars = b"abz019 \r";
+        for round in 0..600_000u32 {
+            let n = [7usize, 4, 2][(round % 3) as usize];
+            let fields = match rnd() % 16 {
+                0 => n + 1,
+                1 => n - 1,
+                _ => n,
+            };
+            let mut line: Vec<u8> = Vec::new();
+            for f in 0..fields {
+                if f > 0 {
+                    line.push(b',');
+                }
+                let len = lens[(rnd() % lens.len() as u64) as usize];
+                let wrap = rnd() % 3 == 0;
+                if wrap {
+                    line.push(b'"');
+                }
+                for _ in 0..len {
+                    line.push(chars[(rnd() % chars.len() as u64) as usize]);
+                }
+                if wrap && rnd() % 12 != 0 {
+                    line.push(b'"');
+                }
+                if rnd() % 40 == 0 {
+                    line.push(b'"');
+                }
+            }
+            if rnd() % 50 == 0 && !line.is_empty() {
+                let at = (rnd() % line.len() as u64) as usize;
+                line[at] = b'"';
+            }
+            let mut data = b"header\n".to_vec();
+            data.extend_from_slice(&line);
+            data.push(b'\n');
+            data.extend_from_slice(&[b'z'; 200]);
+            check_window::<7, true>(&data, &line);
+            check_window::<7, false>(&data, &line);
+            check_window::<4, true>(&data, &line);
+            check_window::<4, false>(&data, &line);
+            check_window::<2, true>(&data, &line);
+            check_window::<2, false>(&data, &line);
         }
     }
 

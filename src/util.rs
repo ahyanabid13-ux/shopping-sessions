@@ -80,6 +80,11 @@ mod ffi {
 pub fn exit_now() -> ! {
     use std::io::Write;
     let _ = std::io::stderr().flush();
+    // A profiling build (see the Dockerfile) must run the C runtime's exit
+    // handlers: they write its counters. Never set in a scored run.
+    if std::env::var_os("SESSIONS_PROFILE_EXIT").is_some() {
+        std::process::exit(0);
+    }
     unsafe { ffi::_exit(0) }
 }
 
