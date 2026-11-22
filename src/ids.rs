@@ -9,8 +9,6 @@
 //! 2^43, and turn back into the exact original bytes.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub const ODD: u64 = 1 << 42;
@@ -75,102 +73,134 @@ pub fn fast_key(b: &[u8], prefix: u8) -> u64 {
 }
 
 /// Thread-safe store of the "odd" ID strings. Rare by construction.
-/// Interns IDs that are not "fast" keys (since scorer V5, one in eight
-/// distinct IDs carries a 32-character hex suffix, so this is a hot path).
+/// Interns IDs that are not "fast" keys. Since scorer V5, one in eight
+/// distinct IDs is a prefix and 32 hex characters, so this is a hot path.
 ///
-/// 64 shards, each its own lock, chosen by a fast hash: parse threads rarely
-/// contend. Keys come from one atomic counter, so they are unique and dense
-/// and `snapshot()` keeps its flat layout (index = key without ODD). One heap
-/// allocation per distinct string.
+/// 64 shards, each behind its own lock, chosen by a fast hash. Each shard
+/// appends every distinct string once to a byte arena (4-byte length, then
+/// the bytes) and indexes it with an open-addressing table of
+/// `fingerprint << 36 | offset` words (0 = empty; offset 0 is a dummy byte).
+/// The key is `ODD | shard << 36 | offset`: exact, unique, and it locates the
+/// bytes directly, so nothing is copied for readers (see `OddView`).
 pub struct Interner {
-    shards: Vec<Mutex<HashMap<Box<[u8]>, u64, FastBuild>>>,
-    next: AtomicU64,
+    shards: Vec<Mutex<Shard>>,
 }
 
 const SHARDS: usize = 64;
+const OFF_BITS: u32 = 36;
+const OFF_MASK: u64 = (1 << OFF_BITS) - 1;
 
-/// A fast, non-cryptographic hash (multiply-rotate over 8-byte words). The
-/// inputs are IDs from the dataset; there is no adversarial-hashing concern.
-#[derive(Default, Clone, Copy)]
-pub struct FastBuild;
-
-pub struct FastHasher(u64);
-
-impl std::hash::BuildHasher for FastBuild {
-    type Hasher = FastHasher;
-    #[inline]
-    fn build_hasher(&self) -> FastHasher {
-        FastHasher(0)
-    }
+struct Shard {
+    table: Vec<u64>,
+    count: usize,
+    arena: Vec<u8>,
 }
 
-impl std::hash::Hasher for FastHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        // Final avalanche so the low bits (hashbrown's buckets) are mixed.
-        let mut x = self.0;
-        x ^= x >> 33;
-        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        x ^= x >> 33;
-        x
-    }
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        const K: u64 = 0x517c_c1b7_2722_0a95;
-        let mut h = self.0;
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
-        }
-        let rest = chunks.remainder();
-        let mut tail = [0u8; 8];
-        tail[..rest.len()].copy_from_slice(rest);
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(tail) ^ (bytes.len() as u64) << 56).wrapping_mul(K);
-        self.0 = h;
-    }
-}
-
+/// Fast non-cryptographic hash of an ID (multiply-rotate over 8-byte words,
+/// then an avalanche). Inputs are dataset IDs; no adversarial concern.
 #[inline]
-fn hash_bytes(b: &[u8]) -> u64 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let mut h = FastBuild.build_hasher();
-    b.hash(&mut h);
-    h.finish()
+pub fn hash_bytes(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+    }
+    let rest = chunks.remainder();
+    let mut tail = [0u8; 8];
+    tail[..rest.len()].copy_from_slice(rest);
+    h = (h.rotate_left(5) ^ u64::from_le_bytes(tail)).wrapping_mul(K);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h
+}
+
+impl Shard {
+    #[inline]
+    fn bytes_at(&self, off: u64) -> &[u8] {
+        let o = off as usize;
+        let len = u32::from_le_bytes(self.arena[o..o + 4].try_into().unwrap()) as usize;
+        &self.arena[o + 4..o + 4 + len]
+    }
+
+    fn grow(&mut self) {
+        let cap = self.table.len() * 2;
+        let mut table = vec![0u64; cap];
+        let mask = cap - 1;
+        for &e in &self.table {
+            if e != 0 {
+                let h = hash_bytes(self.bytes_at(e & OFF_MASK));
+                let mut i = h as usize & mask;
+                while table[i] != 0 {
+                    i = (i + 1) & mask;
+                }
+                table[i] = e;
+            }
+        }
+        self.table = table;
+    }
 }
 
 impl Interner {
-    pub fn new() -> Self {
+    /// `expected`: a rough count of distinct odd IDs, to size the tables.
+    pub fn new(expected: usize) -> Self {
+        let per = ((expected / SHARDS) * 2).max(64).next_power_of_two();
         Interner {
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::with_hasher(FastBuild))).collect(),
-            next: AtomicU64::new(0),
+            shards: (0..SHARDS)
+                .map(|_| Mutex::new(Shard { table: vec![0; per], count: 0, arena: vec![0u8] }))
+                .collect(),
         }
     }
 
     /// The odd key of `b` (bit 42 set).
     pub fn intern(&self, b: &[u8]) -> u64 {
-        let shard = (hash_bytes(b) >> 58) as usize % SHARDS;
-        let mut map = self.shards[shard].lock().unwrap();
-        if let Some(&id) = map.get(b) {
-            return ODD | id;
+        let h = hash_bytes(b);
+        let shard = (h >> 58) as usize % SHARDS;
+        let fp = (h >> 30) & ((1 << 28) - 1);
+        let mut sh = self.shards[shard].lock().unwrap();
+        let mask = sh.table.len() - 1;
+        let mut i = h as usize & mask;
+        loop {
+            let e = sh.table[i];
+            if e == 0 {
+                break;
+            }
+            if e >> OFF_BITS == fp && sh.bytes_at(e & OFF_MASK) == b {
+                return ODD | (shard as u64) << OFF_BITS | (e & OFF_MASK);
+            }
+            i = (i + 1) & mask;
         }
-        let id = self.next.fetch_add(1, AtomicOrdering::Relaxed);
-        assert!(id < ODD, "too many distinct odd IDs");
-        map.insert(b.into(), id);
-        ODD | id
+        let off = sh.arena.len() as u64;
+        assert!(off + 4 + b.len() as u64 <= OFF_MASK, "odd-ID arena full");
+        sh.arena.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        sh.arena.extend_from_slice(b);
+        sh.table[i] = fp << OFF_BITS | off;
+        sh.count += 1;
+        if sh.count * 2 > sh.table.len() {
+            sh.grow();
+        }
+        ODD | (shard as u64) << OFF_BITS | off
     }
 
-    /// A frozen copy of every odd string, indexed by odd key.
-    pub fn snapshot(&self) -> Vec<Vec<u8>> {
-        // Lock every shard first so the counter and the maps agree.
-        let guards: Vec<_> = self.shards.iter().map(|m| m.lock().unwrap()).collect();
-        let n = self.next.load(AtomicOrdering::Relaxed) as usize;
-        let mut out = vec![Vec::new(); n];
-        for g in &guards {
-            for (bytes, &id) in g.iter() {
-                out[id as usize] = bytes.to_vec();
-            }
-        }
-        out
+    /// Read access to every interned string. Holds every shard's lock, so
+    /// take it only while no thread interns (between phases), and drop it
+    /// before interning again.
+    pub fn view(&self) -> OddView<'_> {
+        OddView { shards: self.shards.iter().map(|m| m.lock().unwrap()).collect() }
+    }
+}
+
+/// The bytes behind odd keys (see `Interner::view`).
+pub struct OddView<'a> {
+    shards: Vec<std::sync::MutexGuard<'a, Shard>>,
+}
+
+impl OddView<'_> {
+    #[inline]
+    pub fn get(&self, key: u64) -> &[u8] {
+        let shard = ((key >> OFF_BITS) as usize) & (SHARDS - 1);
+        self.shards[shard].bytes_at(key & OFF_MASK)
     }
 }
 
@@ -186,9 +216,9 @@ pub fn key_of(b: &[u8], prefix: u8, interner: &Interner) -> u64 {
 }
 
 /// Appends the exact bytes of `key` to `out`.
-pub fn write_id(out: &mut Vec<u8>, key: u64, prefix: u8, odd: &[Vec<u8>]) {
+pub fn write_id(out: &mut Vec<u8>, key: u64, prefix: u8, odd: &OddView) {
     if key & ODD != 0 {
-        out.extend_from_slice(&odd[(key & !ODD) as usize]);
+        out.extend_from_slice(odd.get(key));
         return;
     }
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -233,7 +263,7 @@ pub fn key_of_order(order: u64) -> u64 {
 }
 
 /// Byte-wise order of the two IDs `a` and `b` (both written with `prefix`).
-pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &[Vec<u8>]) -> Ordering {
+pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &OddView) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
@@ -257,9 +287,9 @@ pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &[Vec<u8>]) -> Ordering {
 
 /// The bytes of a fast or odd key; fast keys are spelled into `buf`.
 #[inline]
-fn id_bytes<'a>(key: u64, prefix: u8, odd: &'a [Vec<u8>], buf: &'a mut [u8; 9]) -> &'a [u8] {
+fn id_bytes<'a>(key: u64, prefix: u8, odd: &'a OddView, buf: &'a mut [u8; 9]) -> &'a [u8] {
     if key & ODD != 0 {
-        return &odd[(key & !ODD) as usize];
+        return odd.get(key);
     }
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let (len, mut value) = fast_parts(key);
@@ -276,15 +306,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interner_exact_under_growth() {
+        let interner = Interner::new(1); // tiny: forces many rehashes
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut strings: Vec<Vec<u8>> = Vec::new();
+        for i in 0..300_000u64 {
+            let s = if i % 3 == 0 {
+                // V5-style: prefix + 32 hex characters.
+                let mut v = vec![b'u'];
+                v.extend(format!("{:016x}{:016x}", rnd(), rnd()).bytes());
+                v
+            } else {
+                let n = (rnd() % 40) as usize;
+                (0..n).map(|_| [b'a', b'Z', b' ', 0xC3, 0xA9, b'\r', b'0', b'k'][(rnd() % 8) as usize]).collect()
+            };
+            strings.push(s);
+        }
+        // Repeats: intern a random earlier string again.
+        let mut keys = Vec::new();
+        for (i, s) in strings.iter().enumerate() {
+            keys.push(interner.intern(s));
+            if i % 7 == 0 {
+                let j = (rnd() % (i as u64 + 1)) as usize;
+                assert_eq!(interner.intern(&strings[j]), keys[j], "stable key");
+            }
+        }
+        let view = interner.view();
+        for (s, &k) in strings.iter().zip(&keys) {
+            assert!(k & ODD != 0 && k < (1 << KEY_BITS));
+            assert_eq!(view.get(k), &s[..], "round trip");
+        }
+        let mut by_key = std::collections::HashMap::new();
+        for (s, &k) in strings.iter().zip(&keys) {
+            if let Some(prev) = by_key.insert(k, s.clone()) {
+                assert_eq!(&prev, s, "two strings share a key");
+            }
+        }
+        let distinct: std::collections::HashSet<&Vec<u8>> = strings.iter().collect();
+        assert_eq!(by_key.len(), distinct.len(), "one key per distinct string");
+    }
+
+    #[test]
     fn roundtrip_and_order() {
-        let interner = Interner::new();
+        let interner = Interner::new(4);
         let ids: Vec<&[u8]> = vec![
             b"u1", b"u10", b"u9", b"u0", b"u00", b"u000a", b"uzzzzzzzz", b"u00000000", b"U1", b"u1 ", b" u1",
             b"u", b"uA", b"u123456789", b"e1", b"\tB", b"u0a", b"u0", b"uzzzzzzz", b"u0000000", b"u10000000",
             b"uz", b"u00", b"u0z",
         ];
         let keys: Vec<u64> = ids.iter().map(|s| key_of(s, b'u', &interner)).collect();
-        let odd = interner.snapshot();
+        let odd = interner.view();
         for (s, &k) in ids.iter().zip(&keys) {
             let mut out = Vec::new();
             write_id(&mut out, k, b'u', &odd);

@@ -52,7 +52,7 @@ pub struct Ctx<'a> {
     pub first_day: i64,
     pub days: usize,
     pub campaigns: usize,
-    pub odd: &'a [Vec<u8>],
+    pub odd: &'a crate::ids::OddView<'a>,
 }
 
 #[derive(Clone, Copy, Default)]

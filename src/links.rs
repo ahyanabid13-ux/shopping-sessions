@@ -291,7 +291,7 @@ impl Builder {
 }
 
 /// Builds the person table from every thread's link pairs.
-pub fn build(pairs: &[Vec<(u64, u64)>], threads: usize, odd: &[Vec<u8>]) -> LinkTable {
+pub fn build(pairs: &[Vec<(u64, u64)>], threads: usize, odd: &ids::OddView) -> LinkTable {
     let t0 = std::time::Instant::now();
     let lap = |name: &str| if std::env::var_os("SESSIONS_VERBOSE").is_some() { eprintln!("    links.{name}: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3) };
     let total: usize = pairs.iter().map(|p| p.len()).sum();

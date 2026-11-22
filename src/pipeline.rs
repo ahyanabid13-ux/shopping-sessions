@@ -443,7 +443,10 @@ pub fn run() {
         eprintln!("    {threads} threads, window splitter: {}", if pdep { "pdep" } else { "tzcnt" });
     }
 
-    let interner = Interner::new();
+    // Since V5 about one in eight distinct IDs is long (interned): size the
+    // interner's tables for that share of the lines up front.
+    let input_bytes: usize = maps.iter().map(|m| m.bytes().len()).sum();
+    let interner = Interner::new(input_bytes / 40 / 8 + 1024);
     let parser = Parser {
         window_start: window.start,
         window_end: window.end,
@@ -470,8 +473,10 @@ pub fn run() {
         }
         pairs
     });
-    let odd_after_links = interner.snapshot();
+    let odd_after_links = interner.view();
     let link_table = links::build(&pairs, threads, &odd_after_links);
+    // The view holds every interner shard's lock: release it before parsing.
+    drop(odd_after_links);
     drop(pairs);
     lap("links");
 
@@ -610,7 +615,7 @@ pub fn run() {
     lap("dedup");
 
     // ---- 4. People: largest partitions first.
-    let odd = interner.snapshot();
+    let odd = interner.view();
     let ctx = person::Ctx { base, first_day, days, campaigns: campaigns.len(), odd: &odd };
     let mut order: Vec<(usize, usize)> = (0..p2)
         .map(|q| {
