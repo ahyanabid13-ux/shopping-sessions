@@ -539,39 +539,52 @@ impl WindowDates {
 
     #[inline(always)]
     pub fn parse(&self, data: &[u8], start: usize, end: usize) -> Option<i64> {
-        let field = &data[start..end];
-        if field.len() != 20 || field[19] != b'Z' { return timestamp(data, start, end); }
-        let prefix = u64::from_le_bytes(field[..8].try_into().unwrap());
-        let suffix = u32::from_le_bytes([field[8], field[9], field[10], 0]);
+        debug_assert!(start <= end && end <= data.len());
+        if end - start != 20 {
+            return timestamp(data, start, end);
+        }
+        // Bytes: 0..8 "YYYY-MM-", 8..10 "DD", 10 'T', 11..19 "HH:MM:SS", 19 'Z'.
+        let (prefix, mid, clock, z) = unsafe {
+            let p = data.as_ptr().add(start);
+            (
+                (p as *const u64).read_unaligned(),
+                (p.add(8) as *const u32).read_unaligned(),
+                (p.add(11) as *const u64).read_unaligned(),
+                *p.add(19),
+            )
+        };
+        if z != b'Z' {
+            return timestamp(data, start, end);
+        }
+        let suffix = mid & 0x00FF_FFFF;
         let slot = (((suffix & 15) * 10 + ((suffix >> 8) & 15)) & 31) as usize;
         let (head, tail, midnight) = self.0[slot];
-        if head != prefix || tail != suffix { return iso19(data, start); }
-        let clock = u64::from_le_bytes(field[11..19].try_into().unwrap());
-        if clock & !0x0f0f_000f_0f00_0f0f != u64::from_le_bytes(*b"00:00:00") {
+        if head != prefix || tail != suffix {
+            return iso19(data, start);
+        }
+        // The date is one of the table's (valid) days. The clock: every
+        // digit within its own limit (H1 <= 2, M1 and S1 <= 5, the rest
+        // <= 9) and both colons in place, all bytes at once. A byte over
+        // its limit, or not a digit at all, sets a high bit in `x` or in
+        // the sum (no carry leaves a byte while `x` has no high bit).
+        let x = clock ^ u64::from_le_bytes(*b"00:00:00");
+        const ROOM: u64 = u64::from_le_bytes([0x7F - 2, 0x7F - 9, 0x7F, 0x7F - 5, 0x7F - 9, 0x7F, 0x7F - 5, 0x7F - 9]);
+        if (x | x.wrapping_add(ROOM)) & 0x8080_8080_8080_8080 != 0 {
             return None;
         }
-        let pair = |shift: u32| {
-            let v = (clock >> shift) as usize;
-            ((v & 15) << 4) | ((v >> 8) & 15)
-        };
-        let ms = HOURS[pair(0)] + MINUTES[pair(24)] + SECONDS[pair(48)];
-        (ms >= 0).then_some(midnight + ms as i64)
+        // Byte k of x * 2561 is 10 * byte(k-1) + byte(k): bytes 1, 4 and 7
+        // are the hour, the minute and the second.
+        let pairs = x.wrapping_mul(2561);
+        let hour = (pairs >> 8) & 0xFF;
+        let minute = (pairs >> 32) & 0xFF;
+        let second = pairs >> 56;
+        if hour > 23 {
+            return None;
+        }
+        Some(midnight + ((hour * 3600 + minute * 60 + second) * 1000) as i64)
     }
 }
 
-// An invalid pair remains negative even after the two largest valid contributions.
-const fn clock_table(limit: usize, scale: i32) -> [i32; 256] {
-    let mut table = [-100_000_000; 256];
-    let mut n = 0;
-    while n <= limit {
-        table[(n / 10) * 16 + n % 10] = n as i32 * scale;
-        n += 1;
-    }
-    table
-}
-static HOURS: [i32; 256] = clock_table(23, 3_600_000);
-static MINUTES: [i32; 256] = clock_table(59, 60_000);
-static SECONDS: [i32; 256] = clock_table(59, 1000);
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at `data[s..s+20]`; None if it is not exactly that.
 #[inline(always)]
@@ -1049,6 +1062,50 @@ mod tests {
                     assert_eq!(dates.parse(&field, 0, 20), ts::parse(&field));
                 }
             }
+        }
+    }
+
+    /// Random F1-shaped fields on days inside and outside the table, half of
+    /// them damaged in one or two bytes or given an out-of-range clock.
+    #[test]
+    fn window_date_cache_random() {
+        let d = ts::days_from_civil(2028, 2, 20);
+        let dates = WindowDates::new((d - 7) * ts::DAY, (d + 15) * ts::DAY);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let junk = b"0123456789:-TZtz +/.";
+        let mut hits = 0u32;
+        for _ in 0..3_000_000 {
+            let day = d - 40 + (rnd() % 80) as i64;
+            let (y, m, dd) = ts::civil_from_days(day);
+            let (mut hh, mut mi, mut ss) = (rnd() % 24, rnd() % 60, rnd() % 60);
+            match rnd() % 12 {
+                0 => hh = 24 + rnd() % 76,
+                1 => mi = 60 + rnd() % 40,
+                2 => ss = 60 + rnd() % 40,
+                _ => {}
+            }
+            let mut field = format!("{y:04}-{m:02}-{dd:02}T{hh:02}:{mi:02}:{ss:02}Z").into_bytes();
+            assert_eq!(field.len(), 20);
+            if rnd() % 2 == 0 {
+                for _ in 0..1 + rnd() % 2 {
+                    let at = (rnd() % 20) as usize;
+                    field[at] = if rnd() % 8 == 0 { rnd() as u8 } else { junk[(rnd() % junk.len() as u64) as usize] };
+                }
+            }
+            let got = dates.parse(&field, 0, 20);
+            assert_eq!(got, ts::parse(&field), "{:?}", String::from_utf8_lossy(&field));
+            hits += got.is_some() as u32;
+        }
+        assert!(hits > 500_000);
+        // Other lengths go to the general parser.
+        for s in [&b"1791071890000"[..], b"2028-02-20T10:00:00+02:00", b"", b"2028-02-20T10:00:00", b"2028-02-20T10:00:00ZZ"] {
+            assert_eq!(dates.parse(s, 0, s.len()), ts::parse(s));
         }
     }
 
