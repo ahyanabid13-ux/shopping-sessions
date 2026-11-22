@@ -28,8 +28,12 @@ tables grow as rows / partitions, so that count keeps both small.
      ahead, since page-cache pages are scattered 4 KiB frames that the
      hardware prefetcher does not cross.
    - **IDs.** Generator IDs (`e…`, `u…`, `k…`: a letter and up to 8 base-36
-     digits) are decoded with SIMD into a dense 43-bit key. Any other string
-     is interned, so equality stays exact.
+     digits) are decoded with SIMD into a dense 43-bit key. IDs that are a
+     letter and exactly 32 lowercase hex digits are decoded with SIMD into
+     their 128-bit value: event and click IDs keep it as is, user IDs get a
+     slot in a lock-free table (CAS on empty slots, which never move). Any
+     other string, and any long user ID that table refuses (a zero half or a
+     full probe window), is interned, so equality stays exact.
    - **Timestamps.** F1, F2 and F3 are parsed with SIMD/SWAR and a
      calendar table.
    - **Person lookups.** Each is prefetched when its line is parsed and

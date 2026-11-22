@@ -307,6 +307,43 @@ pub fn id_key(data: &[u8], s: usize, e: usize, prefix: u8) -> u64 {
     }
 }
 
+/// (hi, lo) of `data[s..e]` when it is `prefix` + exactly 32 lowercase hex digits [0-9a-f], else None.
+/// hi holds the first 16 digits, first digit most significant, so (hi, lo) numeric order == byte-wise order.
+#[inline(always)]
+pub fn hex_key(data: &[u8], s: usize, e: usize, prefix: u8) -> Option<(u64, u64)> {
+    if e - s != 33 || data[s] != prefix {
+        return None;
+    }
+    unsafe {
+        // data[s + 1..s + 33] is in bounds: e == s + 33 <= data.len().
+        let p = data.as_ptr().add(s + 1);
+        let a = _mm_loadu_si128(p as *const __m128i);
+        let b = _mm_loadu_si128(p.add(16) as *const __m128i);
+        // Signed compares: bytes >= 0x80 are negative and fail both ranges.
+        let dig = |v: __m128i| {
+            _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(b'0' as i8 - 1)), _mm_cmplt_epi8(v, _mm_set1_epi8(b'9' as i8 + 1)))
+        };
+        let alpha = |v: __m128i| {
+            _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(b'a' as i8 - 1)), _mm_cmplt_epi8(v, _mm_set1_epi8(b'f' as i8 + 1)))
+        };
+        let (da, aa, db, ab) = (dig(a), alpha(a), dig(b), alpha(b));
+        let ok = _mm_and_si128(_mm_or_si128(da, aa), _mm_or_si128(db, ab));
+        if _mm_movemask_epi8(ok) != 0xFFFF {
+            return None;
+        }
+        // Nibbles: c - '0', minus 39 more for 'a'..'f'.
+        let zero = _mm_set1_epi8(b'0' as i8);
+        let gap = _mm_set1_epi8(39);
+        let na = _mm_sub_epi8(_mm_sub_epi8(a, zero), _mm_and_si128(aa, gap));
+        let nb = _mm_sub_epi8(_mm_sub_epi8(b, zero), _mm_and_si128(ab, gap));
+        let w = _mm_set1_epi16(0x0110); // bytes (16, 1): the first digit of each pair is the high nibble
+        let bytes = _mm_packus_epi16(_mm_maddubs_epi16(na, w), _mm_maddubs_epi16(nb, w));
+        let hi = (_mm_cvtsi128_si64(bytes) as u64).swap_bytes();
+        let lo = (_mm_extract_epi64::<1>(bytes) as u64).swap_bytes();
+        Some((hi, lo))
+    }
+}
+
 const FIRST_YEAR: i64 = 1900;
 const YEARS: usize = 300;
 
@@ -731,6 +768,80 @@ mod tests {
             data.extend_from_slice(b",yyyyyyyy");
             assert_eq!(id_key(&data, start, end, b'e'), crate::ids::fast_key(s, b'e'), "{:?}", s);
         }
+    }
+
+    fn hex_ref(b: &[u8], prefix: u8) -> Option<(u64, u64)> {
+        if b.len() != 33 || b[0] != prefix {
+            return None;
+        }
+        let mut v: u128 = 0;
+        for &c in &b[1..] {
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => return None,
+            };
+            v = v << 4 | d as u128;
+        }
+        Some(((v >> 64) as u64, v as u64))
+    }
+
+    #[test]
+    fn hex_keys_match_reference() {
+        let mut seed = 0xDEAD_BEEF_u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const HEX: &[u8] = b"0123456789abcdef";
+        let bad: &[u8] = b"AFgG/:`@{\x80\xff \"";
+        let mut samples: Vec<Vec<u8>> = vec![
+            [b"u".as_slice(), &[b'0'; 32]].concat(),
+            [b"u".as_slice(), &[b'f'; 32]].concat(),
+            b"u02423c3d84ab053af78764ce49f23b5c".to_vec(),
+        ];
+        for i in 0..200_000 {
+            let mut s = vec![b'u'];
+            s.extend((0..32).map(|_| HEX[(rnd() % 16) as usize]));
+            match i % 6 {
+                0 => {}
+                1 => {
+                    let at = 1 + (rnd() % 32) as usize;
+                    s[at] = bad[(rnd() % bad.len() as u64) as usize];
+                }
+                2 => {
+                    if rnd() % 2 == 0 {
+                        s.pop();
+                    } else {
+                        s.push(HEX[(rnd() % 16) as usize]);
+                    }
+                }
+                3 => s[0] = b'e',
+                4 => {
+                    let at = 1 + (rnd() % 32) as usize;
+                    s[at] = 0x80 | (rnd() as u8);
+                }
+                _ => {
+                    let at = 1 + (rnd() % 32) as usize;
+                    s[at] = rnd() as u8;
+                }
+            }
+            samples.push(s);
+        }
+        for s in &samples {
+            let mut data = b"xxxxxxxxxxxxxxxx,".to_vec();
+            let start = data.len();
+            data.extend_from_slice(s);
+            let end = data.len();
+            data.extend_from_slice(b",yyyyyyyy");
+            assert_eq!(hex_key(&data, start, end, b'u'), hex_ref(s, b'u'), "{:?}", String::from_utf8_lossy(s));
+            // At the very end of the buffer as well: no over-read.
+            assert_eq!(hex_key(s, 0, s.len(), b'u'), hex_ref(s, b'u'));
+        }
+        assert_eq!(hex_key(&samples[0], 0, 33, b'u'), Some((0, 0)));
+        assert_eq!(hex_key(&samples[1], 0, 33, b'u'), Some((u64::MAX, u64::MAX)));
     }
 
     #[test]

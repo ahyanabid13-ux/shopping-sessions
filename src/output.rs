@@ -36,7 +36,7 @@ pub fn write_user_daily(path: &Path, out: &person::Out, ctx: &person::Ctx, links
             previous = r.pk;
             let user_key = if r.pk & LINKED != 0 { links.names[(r.pk & !LINKED) as usize] } else { r.pk };
             name_buf.clear();
-            ids::write_id(&mut name_buf, user_key, b'u', ctx.odd);
+            ids::write_user_id(&mut name_buf, user_key, ctx.odd, ctx.longs);
         }
         parquet::put_str(&mut user, &name_buf);
         days.extend_from_slice(&((ctx.first_day + r.day as i64) as i32).to_le_bytes());

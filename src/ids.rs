@@ -5,14 +5,21 @@
 //! all digit strings (every 1-digit string, then every 2-digit one, ...)
 //! plus one, so it is never 0. Any other string (upper-case variants,
 //! spaces, carriage returns, anything) is interned and becomes an "odd" key:
-//! bit 42 plus its index in the interner. Both forms are injective, below
-//! 2^43, and turn back into the exact original bytes.
+//! bit 42 plus its index in the interner. A user ID that is `u` + exactly 32
+//! lowercase hex digits (a "long" ID) gets a slot in the lock-free
+//! `LongTable` instead (long.rs) and becomes bits 42 and 41 plus that slot
+//! (event and click IDs of that shape are carried as their 128-bit value).
+//! All forms are injective, below 2^43, and turn back into the exact bytes.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::long::LongTable;
+
 pub const ODD: u64 = 1 << 42;
+/// With ODD: a long user ID, whose low 41 bits are its `LongTable` slot.
+pub const LONG: u64 = 1 << 41;
 /// Keys use the low 43 bits.
 pub const KEY_BITS: u32 = 43;
 
@@ -88,14 +95,14 @@ impl Interner {
         Interner { inner: Mutex::new(InternerInner { index: HashMap::new(), strings: Vec::new() }) }
     }
 
-    /// The odd key of `b` (bit 46 set).
+    /// The odd key of `b` (bit 42 set, bit 41 clear).
     pub fn intern(&self, b: &[u8]) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         if let Some(&id) = inner.index.get(b) {
             return ODD | id;
         }
         let id = inner.strings.len() as u64;
-        assert!(id < ODD, "too many distinct odd IDs");
+        assert!(id < LONG, "too many distinct odd IDs");
         inner.strings.push(b.to_vec());
         inner.index.insert(b.to_vec(), id);
         ODD | id
@@ -165,6 +172,65 @@ pub fn key_of_order(order: u64) -> u64 {
     fast_from(len, (order >> 4) / POW36[8 - len])
 }
 
+/// Whether `key` is a long user key (`ODD | LONG | slot`).
+#[inline(always)]
+pub fn is_long(key: u64) -> bool {
+    key & (ODD | LONG) == ODD | LONG
+}
+
+/// The coarse order key of a long ID whose first 16 hex digits are `hi`: its
+/// first 8 digits read as base-36 digits, shifted like `order_key`, with 15
+/// as the length. Against `order_key` of a fast ID it orders exactly like the
+/// bytes (a tie in the padded value makes the short ID a prefix, and its
+/// length <= 8 < 15); two long IDs with equal first 8 digits tie.
+#[inline]
+pub fn long_order(hi: u64) -> u64 {
+    let mut p8 = 0u64;
+    for i in 0..8 {
+        p8 = p8 * 36 + (hi >> (60 - 4 * i) & 15);
+    }
+    p8 << 4 | 15
+}
+
+/// Appends `prefix` and the 32 hex digits of (hi, lo).
+pub fn write_long(out: &mut Vec<u8>, prefix: u8, hi: u64, lo: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(prefix);
+    for w in [hi, lo] {
+        for i in 0..16 {
+            out.push(HEX[(w >> (60 - 4 * i) & 15) as usize]);
+        }
+    }
+}
+
+/// Appends the exact bytes of the user key `key` (fast, odd or long).
+pub fn write_user_id(out: &mut Vec<u8>, key: u64, odd: &[Vec<u8>], longs: &LongTable) {
+    if is_long(key) {
+        let (hi, lo) = longs.value((key & (LONG - 1)) as usize);
+        write_long(out, b'u', hi, lo);
+    } else {
+        write_id(out, key, b'u', odd);
+    }
+}
+
+/// Byte-wise order of the user IDs of keys `a` and `b`.
+pub fn cmp_user_ids(a: u64, b: u64, odd: &[Vec<u8>], longs: &LongTable) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    if a & ODD == 0 && b & ODD == 0 {
+        return cmp_ids(a, b, b'u', odd);
+    }
+    if is_long(a) && is_long(b) {
+        return longs.value((a & (LONG - 1)) as usize).cmp(&longs.value((b & (LONG - 1)) as usize));
+    }
+    let mut sa = Vec::with_capacity(40);
+    let mut sb = Vec::with_capacity(40);
+    write_user_id(&mut sa, a, odd, longs);
+    write_user_id(&mut sb, b, odd, longs);
+    sa.cmp(&sb)
+}
+
 /// Byte-wise order of the two IDs `a` and `b` (both written with `prefix`).
 pub fn cmp_ids(a: u64, b: u64, prefix: u8, odd: &[Vec<u8>]) -> Ordering {
     if a == b {
@@ -193,27 +259,96 @@ mod tests {
     #[test]
     fn roundtrip_and_order() {
         let interner = Interner::new();
-        let ids: Vec<&[u8]> = vec![
-            b"u1", b"u10", b"u9", b"u0", b"u00", b"u000a", b"uzzzzzzzz", b"u00000000", b"U1", b"u1 ", b" u1",
+        let longs = LongTable::new(64);
+        // `u` + head, padded with '0' to 33 bytes but ending in '1' (a zero
+        // half would send the ID to the interner).
+        let z = |head: &str| -> Vec<u8> {
+            let mut v = format!("u{head}").into_bytes();
+            if v.len() < 33 {
+                v.resize(33, b'0');
+                v[32] = b'1';
+            }
+            v
+        };
+        let mut ids: Vec<Vec<u8>> = [
+            &b"u1"[..], b"u10", b"u9", b"u0", b"u00", b"u000a", b"uzzzzzzzz", b"u00000000", b"U1", b"u1 ", b" u1",
             b"u", b"uA", b"u123456789", b"e1", b"\tB", b"u0a", b"u0", b"uzzzzzzz", b"u0000000", b"u10000000",
-            b"uz", b"u00", b"u0z",
-        ];
-        let keys: Vec<u64> = ids.iter().map(|s| key_of(s, b'u', &interner)).collect();
+            b"uz", b"u00", b"u0z", b"u0a1b",
+        ]
+        .iter()
+        .map(|s| s.to_vec())
+        .collect();
+        ids.extend([
+            z("0a1b"),
+            z("0a1b0000000000000000000000000001"),
+            z("0a1b2c3d"),
+            z("0a1b2c3d1"),
+            z("0a1b2c3d0000000000000000000000ff"),
+            z("0a1b2c3e"),
+            z("ffffffffffffffffffffffffffffffff"),
+            z("f"),
+            z("9"),
+            z("1"),
+            z("00000001"),
+            z("0a1b2c3"),
+            z("0000000000000000000000000000001"), // hi == 0: falls back to the interner
+            z(""),                                // hi == 0: interner
+            [&b"u"[..], &[b'0'; 32]].concat(),     // all zero: interner
+            [&b"u12345678"[..], &[b'0'; 24]].concat(), // lo == 0: interner
+            b"U0A1B0000000000000000000000000000".to_vec(),
+            b"u0A1B0000000000000000000000000000".to_vec(),
+            b"u0a1b00000000000000000000000000000".to_vec(),
+            b"u0a1b2c3d".to_vec(),
+            b"u0a1b2c3e".to_vec(),
+            b"uf".to_vec(),
+            b"ug".to_vec(),
+        ]);
+        let key_of_user = |s: &[u8]| -> u64 {
+            if let Some((hi, lo)) = crate::fast::hex_key(s, 0, s.len(), b'u') {
+                if let Some(slot) = longs.slot(hi, lo) {
+                    return ODD | LONG | slot as u64;
+                }
+            }
+            key_of(s, b'u', &interner)
+        };
+        let keys: Vec<u64> = ids.iter().map(|s| key_of_user(s)).collect();
+        assert!(keys.iter().filter(|&&k| is_long(k)).count() >= 10);
         let odd = interner.snapshot();
         for (s, &k) in ids.iter().zip(&keys) {
             let mut out = Vec::new();
-            write_id(&mut out, k, b'u', &odd);
-            assert_eq!(&out[..], *s);
+            write_user_id(&mut out, k, &odd, &longs);
+            assert_eq!(&out[..], &s[..]);
             if k & ODD == 0 {
+                out.clear();
+                write_id(&mut out, k, b'u', &odd);
+                assert_eq!(&out[..], &s[..]);
                 assert_eq!(key_of_order(order_key(k)), k);
             }
         }
+        // The order number of a fast key or the coarse one of a long key.
+        let coarse = |k: u64| -> Option<u64> {
+            if k & ODD == 0 {
+                Some(order_key(k))
+            } else if is_long(k) {
+                Some(long_order(longs.value((k & (LONG - 1)) as usize).0))
+            } else {
+                None
+            }
+        };
         for (i, &a) in keys.iter().enumerate() {
             for (j, &b) in keys.iter().enumerate() {
-                assert_eq!(cmp_ids(a, b, b'u', &odd), ids[i].cmp(ids[j]), "{:?} {:?}", ids[i], ids[j]);
+                let want = ids[i].cmp(&ids[j]);
+                assert_eq!(cmp_user_ids(a, b, &odd, &longs), want, "{:?} {:?}", ids[i], ids[j]);
                 assert_eq!(a == b, ids[i] == ids[j]);
                 if a & ODD == 0 && b & ODD == 0 {
-                    assert_eq!(order_key(a).cmp(&order_key(b)), ids[i].cmp(ids[j]));
+                    assert_eq!(cmp_ids(a, b, b'u', &odd), want);
+                    assert_eq!(order_key(a).cmp(&order_key(b)), want);
+                }
+                if let (Some(oa), Some(ob)) = (coarse(a), coarse(b)) {
+                    if is_long(a) && is_long(b) && oa == ob {
+                        continue; // decided by the full value
+                    }
+                    assert_eq!(oa.cmp(&ob), want, "{:?} {:?}", ids[i], ids[j]);
                 }
             }
         }
